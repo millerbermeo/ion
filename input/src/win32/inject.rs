@@ -2,10 +2,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, XBUTTON1, XBUTTON2,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    XBUTTON1, XBUTTON2,
 };
 
 use ionconnect_protocol::MouseButton;
@@ -120,10 +121,10 @@ impl InputInjector for WindowsInjector {
                     MouseButton::Right => (MOUSEEVENTF_RIGHTUP, 0),
                     MouseButton::Middle if pressed => (MOUSEEVENTF_MIDDLEDOWN, 0),
                     MouseButton::Middle => (MOUSEEVENTF_MIDDLEUP, 0),
-                    MouseButton::Back if pressed => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON1.0)),
-                    MouseButton::Back => (MOUSEEVENTF_XUP, i32::from(XBUTTON1.0)),
-                    MouseButton::Forward if pressed => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON2.0)),
-                    MouseButton::Forward => (MOUSEEVENTF_XUP, i32::from(XBUTTON2.0)),
+                    MouseButton::Back if pressed => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON1)),
+                    MouseButton::Back => (MOUSEEVENTF_XUP, i32::from(XBUTTON1)),
+                    MouseButton::Forward if pressed => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON2)),
+                    MouseButton::Forward => (MOUSEEVENTF_XUP, i32::from(XBUTTON2)),
                 };
                 send_mouse(0, 0, mouse_data, flags)
             }
