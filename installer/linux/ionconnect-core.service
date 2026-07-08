@@ -5,10 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Placeholder: el binario `ionconnect-core` todavía no existe (no es una de
-# las fases numeradas 1-11 del roadmap, es la capa de orquestación final que
-# las conecta a todas). Esta unit queda lista para cuando exista.
-ExecStart=/usr/bin/ionconnect-core
+# Ajustar la ruta si `ionconnect-core` no quedó en /usr/bin (p. ej.
+# ~/.local/bin/ionconnect-core si se instaló con install.sh).
+ExecStart=%h/.local/bin/ionconnect-core
 Restart=on-failure
 RestartSec=2
 # Servicio de usuario, no de sistema: corre con la sesión gráfica del

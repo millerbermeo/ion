@@ -27,7 +27,7 @@ log "Instalando dependencias del sistema (pide sudo)..."
 sudo apt-get update -y
 sudo apt-get install -y \
   build-essential curl git pkg-config \
-  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev \
   libssl-dev libx11-dev
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -49,10 +49,11 @@ else
 fi
 
 log "Compilando IonConnect (release, puede tardar varios minutos)..."
-(cd "$INSTALL_DIR" && cargo build --release -p ionconnect-gui)
+(cd "$INSTALL_DIR" && cargo build --release -p ionconnect-gui -p ionconnect-core)
 
 mkdir -p "$BIN_DIR"
 install -m 755 "$INSTALL_DIR/target/release/ionconnect-gui" "$BIN_DIR/ionconnect-gui"
+install -m 755 "$INSTALL_DIR/target/release/ionconnect-core" "$BIN_DIR/ionconnect-core"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

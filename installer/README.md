@@ -12,14 +12,12 @@ cargo tauri build
 ```
 
 Requiere en el sistema de build: `libwebkit2gtk-4.1-dev`,
-`libappindicator3-dev`, `librsvg2-dev`.
+`libappindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`.
 
 `ionconnect-core.service` es la unit de systemd (de **usuario**, no de
-sistema — necesita la sesión gráfica) para el futuro binario
-`ionconnect-core`. Ese binario todavía no existe: la orquestación final que
-conecta `network`+`input`+`screen`+`clipboard`+`config` en un servicio de
-fondo no es una de las fases numeradas del roadmap (1-11), sino la capa que
-las une a todas. Cuando exista, instalar la unit con:
+sistema — necesita la sesión gráfica) para el binario `ionconnect-core`
+(ya implementado — ver `core/`, orquesta captura→red→inyección). Instalar
+la unit con:
 
 ```
 mkdir -p ~/.config/systemd/user
@@ -38,7 +36,6 @@ mismo límite que los backends `win32` de `input`.
 
 ## Qué falta para un instalador completo
 
-- El binario `ionconnect-core` (fuera del alcance de las fases 1-11).
 - Firma de código para el instalador de Windows (fase de release, no de
   desarrollo).
 - Un `.desktop` file y entrada de autostart para Linux, análogo a la unit

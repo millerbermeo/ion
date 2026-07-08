@@ -49,13 +49,14 @@ if (Test-Path "$InstallDir\.git") {
 Write-Step "Compilando IonConnect (release, puede tardar varios minutos)..."
 Push-Location $InstallDir
 try {
-    cargo build --release -p ionconnect-gui
+    cargo build --release -p ionconnect-gui -p ionconnect-core
 } finally {
     Pop-Location
 }
 
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Copy-Item "$InstallDir\target\release\ionconnect-gui.exe" "$BinDir\ionconnect-gui.exe" -Force
+Copy-Item "$InstallDir\target\release\ionconnect-core.exe" "$BinDir\ionconnect-core.exe" -Force
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$BinDir*") {
