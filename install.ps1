@@ -100,4 +100,18 @@ if ($userPath -notlike "*$BinDir*") {
     Write-Step "Se agregó $BinDir al PATH del usuario. Abrí una terminal nueva para que tome efecto."
 }
 
-Write-Step "Listo. Corré 'ionconnect-gui' para abrir la aplicación."
+Write-Step "Creando accesos directos (Escritorio y menú Inicio)..."
+$iconPath = "$InstallDir\gui\src-tauri\icons\icon.ico"
+$shell = New-Object -ComObject WScript.Shell
+$startMenuDir = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
+foreach ($targetDir in @([Environment]::GetFolderPath("Desktop"), $startMenuDir)) {
+    $shortcut = $shell.CreateShortcut("$targetDir\IonConnect.lnk")
+    $shortcut.TargetPath = "$BinDir\ionconnect-gui.exe"
+    $shortcut.WorkingDirectory = $BinDir
+    if (Test-Path $iconPath) {
+        $shortcut.IconLocation = $iconPath
+    }
+    $shortcut.Save()
+}
+
+Write-Step "Listo. Buscá 'IonConnect' en el menú Inicio o el ícono del Escritorio."

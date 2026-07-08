@@ -27,7 +27,7 @@ log "Instalando dependencias del sistema (pide sudo)..."
 sudo apt-get update -y
 sudo apt-get install -y \
   build-essential curl git pkg-config \
-  libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libdbus-1-dev \
+  libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev \
   libssl-dev libx11-dev
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -55,9 +55,26 @@ mkdir -p "$BIN_DIR"
 install -m 755 "$INSTALL_DIR/target/release/ionconnect-gui" "$BIN_DIR/ionconnect-gui"
 install -m 755 "$INSTALL_DIR/target/release/ionconnect-core" "$BIN_DIR/ionconnect-core"
 
+log "Creando acceso directo (menú de aplicaciones)..."
+ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+DESKTOP_DIR="$HOME/.local/share/applications"
+mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
+install -m 644 "$INSTALL_DIR/gui/src-tauri/icons/icon.png" "$ICON_DIR/ionconnect.png"
+cat > "$DESKTOP_DIR/ionconnect.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=IonConnect
+Comment=Compartí mouse y teclado entre equipos en la misma LAN
+Exec=$BIN_DIR/ionconnect-gui
+Icon=ionconnect
+Terminal=false
+Categories=Utility;Network;
+EOF
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" || true
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) log "Agregá $BIN_DIR a tu PATH (por ejemplo en ~/.bashrc): export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-log "Listo. Corré 'ionconnect-gui' para abrir la aplicación."
+log "Listo. Buscá 'IonConnect' en el menú de aplicaciones, o corré 'ionconnect-gui'."
