@@ -102,15 +102,7 @@ pub async fn run_server(
         layout,
         local_device,
     )));
-    {
-        let handoff = handoff.clone();
-        let routing = routing.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = crate::input_session::run_x11_input_session(&handoff, &routing) {
-                tracing::error!(%err, "la sesión de captura de entrada terminó con error");
-            }
-        });
-    }
+    spawn_input_session(handoff, routing.clone());
 
     let known_peers = Arc::new(known_peers);
     loop {
@@ -137,6 +129,35 @@ pub async fn run_server(
             }
         });
     }
+}
+
+/// La sesión de captura real solo existe en X11 (ver `input_session`, que a
+/// su vez depende de `ionconnect_input::x11`, gateado a
+/// `cfg(all(unix, not(target_os = "macos")))`). En cualquier otra
+/// plataforma, elegir `Role::Server` deja el servicio escuchando y
+/// autenticando peers con normalidad, pero sin nada que capturar ni
+/// reenviar — se loguea una sola vez en vez de fallar la compilación o el
+/// arranque entero.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_input_session(
+    handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
+    routing: Arc<Routing>,
+) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = crate::input_session::run_x11_input_session(&handoff, &routing) {
+            tracing::error!(%err, "la sesión de captura de entrada terminó con error");
+        }
+    });
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn spawn_input_session(
+    _handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
+    _routing: Arc<Routing>,
+) {
+    tracing::error!(
+        "el rol Server todavía no está soportado en este sistema operativo (solo Linux/X11 por ahora, ver README) — este equipo no va a capturar ni reenviar entrada"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

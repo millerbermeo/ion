@@ -2,6 +2,7 @@ mod client;
 mod error;
 mod handoff;
 mod identity;
+#[cfg(all(unix, not(target_os = "macos")))]
 mod input_session;
 mod peer_id;
 mod routing;
