@@ -37,6 +37,24 @@ if (-not (Test-Command "cargo")) {
     Write-Step "Rust ya está instalado ($(cargo --version))."
 }
 
+# El target por defecto de rustup en Windows (x86_64-pc-windows-msvc) necesita
+# el linker de Visual Studio (link.exe). Sin esto, cualquier `cargo build`
+# falla con "linker `link.exe` not found" después de compilar un rato — mejor
+# avisar antes de perder tiempo compilando que dejar que falle a mitad de camino.
+$vswhere = "$env:ProgramFiles (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+$hasBuildTools = (Test-Command "link") -or ((Test-Path $vswhere) -and ((& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) -ne $null))
+if (-not $hasBuildTools) {
+    Write-Host ""
+    Write-Host "Falta el linker de MSVC (Visual Studio Build Tools) — Rust no puede compilar nada sin esto en Windows." -ForegroundColor Yellow
+    Write-Host "Instalalo con winget y volvé a correr este script:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host '  winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet"' -ForegroundColor White
+    Write-Host ""
+    Write-Host "(o instalá manualmente desde https://visualstudio.microsoft.com/visual-cpp-build-tools/ y elegí el workload `"Desktop development with C++`")" -ForegroundColor Yellow
+    Write-Host ""
+    throw "Visual Studio Build Tools (C++) no encontrado."
+}
+
 if (Test-Path "$InstallDir\.git") {
     Write-Step "Actualizando código fuente existente en $InstallDir..."
     git -C $InstallDir pull --ff-only
@@ -50,6 +68,9 @@ Write-Step "Compilando IonConnect (release, puede tardar varios minutos)..."
 Push-Location $InstallDir
 try {
     cargo build --release -p ionconnect-gui -p ionconnect-core
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build falló (código $LASTEXITCODE) — revisá el error de arriba."
+    }
 } finally {
     Pop-Location
 }
