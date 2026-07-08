@@ -41,8 +41,23 @@ if (-not (Test-Command "cargo")) {
 # el linker de Visual Studio (link.exe). Sin esto, cualquier `cargo build`
 # falla con "linker `link.exe` not found" después de compilar un rato — mejor
 # avisar antes de perder tiempo compilando que dejar que falle a mitad de camino.
-$vswhere = "$env:ProgramFiles (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-$hasBuildTools = (Test-Command "link") -or ((Test-Path $vswhere) -and ((& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) -ne $null))
+#
+# `${env:ProgramFiles(x86)}` (con paréntesis dentro de las llaves) es la
+# única forma correcta de leer esa variable de entorno específica en
+# PowerShell — su nombre real incluye "(x86)". `-latest` evita que
+# vswhere devuelva más de una línea si hay varias instalaciones de VS.
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$hasBuildTools = $false
+if (Test-Path $vswhere) {
+    $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if ($installationPath) {
+        $hasBuildTools = $true
+    }
+}
+if (-not $hasBuildTools -and (Test-Command "cl")) {
+    # cl.exe ya está en el PATH (por ejemplo, corriendo desde un "Developer PowerShell for VS").
+    $hasBuildTools = $true
+}
 if (-not $hasBuildTools) {
     Write-Host ""
     Write-Host "Falta el linker de MSVC (Visual Studio Build Tools) — Rust no puede compilar nada sin esto en Windows." -ForegroundColor Yellow
