@@ -109,6 +109,9 @@ impl Settings {
     ///
     /// Devuelve [`ConfigError::Io`] si no se pudo escribir `path`.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(path, self.to_toml_string()?)?;
         Ok(())
     }
