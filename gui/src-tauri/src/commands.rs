@@ -4,6 +4,14 @@ use tauri::State;
 
 use crate::state::AppState;
 
+/// El `device_id` derivado de la identidad TLS de este equipo, en el mismo
+/// formato hexadecimal que espera `PeerConfig::device_id` — para que el
+/// usuario lo copie al configurar este equipo como peer en otra máquina.
+#[tauri::command]
+pub fn get_device_id(state: State<AppState>) -> String {
+    state.device_id_hex.clone()
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Settings {
     state

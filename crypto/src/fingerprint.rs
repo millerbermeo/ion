@@ -19,6 +19,14 @@ impl Fingerprint {
         Self(digest.into())
     }
 
+    /// Reconstruye un fingerprint a partir de sus 32 bytes crudos — para
+    /// cargar uno persistido (p. ej. por un `TrustStore` respaldado en
+    /// disco), no para calcular uno nuevo.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0

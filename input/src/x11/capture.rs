@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use ionconnect_shared::KeyModifiers;
 use x11rb::connection::Connection as _;
@@ -23,32 +23,86 @@ fn x11_error(err: impl std::fmt::Display) -> InputError {
 /// especificación `XInput2`, sección 4).
 const XI_ALL_DEVICES: u16 = 0;
 
-/// Captura eventos globales de mouse/teclado vía eventos **crudos** de
-/// `XInput2` (`XI_RawMotion`/`XI_RawButtonPress`/`XI_RawKeyPress`, etc.).
+/// Posición acumulada compartida entre el hilo de captura (que la actualiza
+/// a partir de deltas crudos) y quien orquesta la sesión (que la reinicia
+/// al valor exacto del punto de entrada en cada hand-off). Un
+/// `Mutex<(i32, i32)>` alcanza: la tasa de eventos de mouse (cientos/s) no
+/// genera contención real en un lock que se mantiene microsegundos.
+#[derive(Clone)]
+pub struct SharedPosition(Arc<Mutex<(i32, i32)>>);
+
+impl SharedPosition {
+    #[must_use]
+    pub fn new(x: i32, y: i32) -> Self {
+        Self(Arc::new(Mutex::new((x, y))))
+    }
+
+    /// Reinicia la posición acumulada — llamar exactamente en el momento de
+    /// un hand-off, con el punto de entrada calculado por
+    /// `screen::Layout::detect_crossing`.
+    ///
+    /// # Panics
+    ///
+    /// Solo si el lock quedó envenenado por un panic previo mientras
+    /// estaba tomado — no ocurre en uso normal.
+    pub fn reset(&self, x: i32, y: i32) {
+        *self
+            .0
+            .lock()
+            .expect("el lock de posición no debería estar envenenado") = (x, y);
+    }
+
+    /// # Panics
+    ///
+    /// Solo si el lock quedó envenenado por un panic previo mientras
+    /// estaba tomado — no ocurre en uso normal.
+    #[must_use]
+    pub fn get(&self) -> (i32, i32) {
+        *self
+            .0
+            .lock()
+            .expect("el lock de posición no debería estar envenenado")
+    }
+
+    fn add(&self, dx: i32, dy: i32) -> (i32, i32) {
+        let mut guard = self
+            .0
+            .lock()
+            .expect("el lock de posición no debería estar envenenado");
+        guard.0 += dx;
+        guard.1 += dy;
+        *guard
+    }
+}
+
+/// Captura eventos globales de mouse/teclado vía `XInput2`.
 ///
-/// Se usan eventos crudos (deltas relativos) en vez de eventos normales
-/// (posición absoluta) porque los crudos se entregan sin importar qué
-/// ventana tiene el foco o si el puntero está agarrado/oculto — justo lo que
-/// hace falta cuando este equipo está "cediendo" el control y el cursor
-/// local ya no importa, solo el movimiento relativo que hay que reenviar.
+/// Selecciona **ambos** tipos de evento de movimiento y por eso emite dos
+/// variantes distintas de [`CapturedEvent`]:
+///
+/// - `XI_Motion` (no crudo): posición absoluta real del cursor del sistema
+///   operativo. Se sigue entregando aunque no tengamos el puntero agarrado,
+///   así que sirve para detectar que el cursor llegó al borde de la
+///   pantalla mientras el usuario todavía lo controla normalmente →
+///   [`CapturedEvent::AbsolutePosition`].
+/// - `XI_RawMotion` (crudo): delta relativo de hardware, entregado sin
+///   importar grabs ni foco de ventana — por eso sigue funcionando incluso
+///   con el puntero agarrado y oculto en el borde, que es exactamente la
+///   situación tras un hand-off → [`CapturedEvent::MouseMove`] (acumulado
+///   sobre [`SharedPosition`]).
 pub struct X11Capture {
     conn: RustConnection,
-    origin_x: i32,
-    origin_y: i32,
+    position: SharedPosition,
     stop_flag: Arc<AtomicBool>,
 }
 
 impl X11Capture {
-    /// `origin_{x,y}` es la posición absoluta desde la que empezar a
-    /// acumular deltas (típicamente el punto donde el cursor cruzó el borde
-    /// de pantalla hacia este equipo).
-    ///
     /// # Errors
     ///
     /// Devuelve [`InputError::X11Connection`] si no hay servidor X
     /// disponible o si la extensión `XInput2` no responde a la versión
     /// solicitada.
-    pub fn connect(origin_x: i32, origin_y: i32) -> Result<Self, InputError> {
+    pub fn connect(position: SharedPosition) -> Result<Self, InputError> {
         let (conn, screen_num) = x11rb::connect(None).map_err(x11_error)?;
         let root: Window = conn.setup().roots[screen_num].root;
 
@@ -57,7 +111,8 @@ impl X11Capture {
             .reply()
             .map_err(x11_error)?;
 
-        let mask = XIEventMask::RAW_MOTION
+        let mask = XIEventMask::MOTION
+            | XIEventMask::RAW_MOTION
             | XIEventMask::RAW_BUTTON_PRESS
             | XIEventMask::RAW_BUTTON_RELEASE
             | XIEventMask::RAW_KEY_PRESS
@@ -73,26 +128,32 @@ impl X11Capture {
 
         Ok(Self {
             conn,
-            origin_x,
-            origin_y,
+            position,
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[must_use]
+    pub fn shared_position(&self) -> SharedPosition {
+        self.position.clone()
     }
 }
 
 impl InputCapture for X11Capture {
     fn run(&mut self, sink: Sender<CapturedEvent>) -> Result<(), InputError> {
-        let mut x = self.origin_x;
-        let mut y = self.origin_y;
-
         while !self.stop_flag.load(Ordering::Relaxed) {
             let event = self.conn.wait_for_event().map_err(x11_error)?;
             let emitted = match event {
+                Event::XinputMotion(ev) => Some(CapturedEvent::AbsolutePosition {
+                    x: ev.root_x >> 16,
+                    y: ev.root_y >> 16,
+                }),
                 Event::XinputRawMotion(ev) => {
                     let dx = valuator_value(&ev.valuator_mask, &ev.axisvalues, 0).unwrap_or(0.0);
                     let dy = valuator_value(&ev.valuator_mask, &ev.axisvalues, 1).unwrap_or(0.0);
-                    x += clamp_delta_to_i32(dx);
-                    y += clamp_delta_to_i32(dy);
+                    let (x, y) = self
+                        .position
+                        .add(clamp_delta_to_i32(dx), clamp_delta_to_i32(dy));
                     Some(CapturedEvent::MouseMove { x, y })
                 }
                 Event::XinputRawButtonPress(ev) => {
@@ -133,7 +194,7 @@ impl InputCapture for X11Capture {
         self.stop_flag.store(true, Ordering::Relaxed);
         // `wait_for_event` sigue bloqueado hasta el próximo evento real del
         // servidor; no hay forma de interrumpirlo sin generar uno. Quien
-        // orqueste la captura (fase `core`) debe tolerar ese último evento
+        // orqueste la captura (crate `core`) debe tolerar ese último evento
         // de cola antes de que el hilo termine.
     }
 }
@@ -146,4 +207,18 @@ fn clamp_delta_to_i32(value: f64) -> i32 {
     value
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_position_accumulates_and_resets() {
+        let position = SharedPosition::new(10, 20);
+        assert_eq!(position.add(5, -3), (15, 17));
+        assert_eq!(position.add(1, 1), (16, 18));
+        position.reset(0, 0);
+        assert_eq!(position.get(), (0, 0));
+    }
 }

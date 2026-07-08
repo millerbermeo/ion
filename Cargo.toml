@@ -10,6 +10,7 @@ members = [
     "clipboard",
     "config",
     "ipc",
+    "core",
     "gui/src-tauri",
 ]
 

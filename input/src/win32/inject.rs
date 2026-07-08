@@ -96,6 +96,8 @@ fn send_key(vk: u16, key_up: bool) -> Result<(), InputError> {
 impl InputInjector for WindowsInjector {
     fn inject(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
         match *event {
+            // Solo tiene sentido del lado de captura; no hay nada que inyectar.
+            CapturedEvent::AbsolutePosition { .. } => Ok(()),
             CapturedEvent::MouseMove { x, y } => {
                 let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
                 let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };

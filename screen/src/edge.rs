@@ -1,6 +1,7 @@
 /// Borde de un escritorio virtual por el que el cursor puede "salir" hacia
 /// el equipo vecino configurado en ese borde.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ScreenEdge {
     Left,
     Right,

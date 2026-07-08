@@ -43,6 +43,9 @@ impl X11Injector {
 impl InputInjector for X11Injector {
     fn inject(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
         match *event {
+            // Solo tiene sentido del lado de captura (detección de borde
+            // antes de agarrar el puntero); no hay nada que inyectar.
+            CapturedEvent::AbsolutePosition { .. } => {}
             CapturedEvent::MouseMove { x, y } => {
                 let (x, y) = (clamp_to_i16(x), clamp_to_i16(y));
                 self.conn

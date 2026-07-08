@@ -9,6 +9,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+ionconnect-screen = { version = "0.1.0", path = "../screen" }
 notify = "8.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"

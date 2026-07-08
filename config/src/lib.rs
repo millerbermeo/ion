@@ -10,5 +10,5 @@ mod settings;
 mod watcher;
 
 pub use error::ConfigError;
-pub use settings::{PairingModePreference, Settings};
+pub use settings::{PairingModePreference, PeerConfig, Role, Settings};
 pub use watcher::ConfigWatcher;

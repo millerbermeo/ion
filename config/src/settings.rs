@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use ionconnect_screen::ScreenEdge;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -8,12 +9,38 @@ use crate::error::ConfigError;
 /// Espejo liviano de `ionconnect_crypto::PairingMode` — se mantiene
 /// separado en vez de depender de `crypto` desde `config` solo para dos
 /// variantes; la conversión es responsabilidad de quien conecte ambos
-/// crates (`core`, fase posterior).
+/// crates (`core`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PairingModePreference {
     AutoTrustOnFirstUse,
     RejectUnknown,
+}
+
+/// Rol de este equipo en la sesión de `IonConnect`.
+///
+/// `Server` es el equipo con el mouse/teclado físico: captura la entrada y
+/// decide, según [`Layout`](ionconnect_screen::Layout), a cuál `Client` se
+/// la reenvía cuando el cursor cruza un borde configurado. `Client` solo
+/// recibe entrada y la inyecta localmente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Server,
+    Client,
+}
+
+/// Un equipo vecino conocido, del punto de vista del `Server`: en qué borde
+/// de la pantalla de *este* equipo hay que cruzar para cederle el control.
+///
+/// `device_id` se guarda en hexadecimal (no como el tipo `DeviceId` de
+/// `shared` directamente) para que el TOML sea legible/editable a mano;
+/// `core` hace la conversión al conectar con `crypto`/`protocol`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConfig {
+    pub device_id: String,
+    pub name: String,
+    pub edge: ScreenEdge,
 }
 
 /// Configuración persistente de una instalación de `IonConnect`.
@@ -29,6 +56,13 @@ pub struct Settings {
     pub discovery_enabled: bool,
     pub pairing_mode: PairingModePreference,
     pub log_level: String,
+    pub role: Role,
+    /// Solo relevante para `Role::Server`: a qué borde de esta pantalla
+    /// corresponde cada equipo vecino.
+    pub peers: Vec<PeerConfig>,
+    /// Solo relevante para `Role::Client`: `host:puerto` del servidor al que
+    /// conectarse. `None` para descubrirlo por mDNS en la LAN.
+    pub server_address: Option<String>,
 }
 
 impl Default for Settings {
@@ -39,6 +73,9 @@ impl Default for Settings {
             discovery_enabled: true,
             pairing_mode: PairingModePreference::RejectUnknown,
             log_level: "info".to_string(),
+            role: Role::Server,
+            peers: Vec::new(),
+            server_address: None,
         }
     }
 }
@@ -89,6 +126,13 @@ mod tests {
             discovery_enabled: false,
             pairing_mode: PairingModePreference::AutoTrustOnFirstUse,
             log_level: "debug".to_string(),
+            role: Role::Client,
+            peers: vec![PeerConfig {
+                device_id: "abc123".to_string(),
+                name: "laptop-sala".to_string(),
+                edge: ScreenEdge::Right,
+            }],
+            server_address: Some("192.168.1.10:44890".to_string()),
         };
         let toml_text = settings
             .to_toml_string()
@@ -104,6 +148,8 @@ mod tests {
         assert_eq!(settings.device_name, "solo-nombre");
         assert_eq!(settings.listen_port, Settings::default().listen_port);
         assert!(settings.discovery_enabled);
+        assert_eq!(settings.role, Role::Server);
+        assert!(settings.peers.is_empty());
     }
 
     #[test]

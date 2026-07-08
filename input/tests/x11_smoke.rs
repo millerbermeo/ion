@@ -11,7 +11,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ionconnect_input::x11::{X11Capture, X11Injector};
+use ionconnect_input::x11::{SharedPosition, X11Capture, X11Control, X11Injector};
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_protocol::MouseButton;
 
@@ -40,7 +40,8 @@ fn injects_mouse_move_and_click_without_error() {
 #[ignore = "requiere un servidor X real (Xephyr/Xvfb) en $DISPLAY"]
 fn capture_reports_injected_motion() {
     let (tx, rx) = mpsc::channel();
-    let mut capture = X11Capture::connect(0, 0).expect("XInput2 debería estar disponible");
+    let position = SharedPosition::new(0, 0);
+    let mut capture = X11Capture::connect(position).expect("XInput2 debería estar disponible");
 
     let handle = std::thread::spawn(move || {
         use ionconnect_input::InputCapture as _;
@@ -54,10 +55,51 @@ fn capture_reports_injected_motion() {
         .inject(&CapturedEvent::MouseMove { x: 10, y: 10 })
         .expect("mover el mouse no debería fallar");
 
-    let event = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("se esperaba recibir un evento de movimiento capturado");
-    assert!(matches!(event, CapturedEvent::MouseMove { .. }));
+    // El servidor puede entregar primero el evento no crudo (posición
+    // absoluta) y luego el crudo (delta acumulado), o viceversa; alcanza
+    // con que aparezca alguno de movimiento dentro de la ventana de tiempo.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_motion = false;
+    while std::time::Instant::now() < deadline {
+        let Ok(event) =
+            rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        else {
+            break;
+        };
+        if matches!(
+            event,
+            CapturedEvent::MouseMove { .. } | CapturedEvent::AbsolutePosition { .. }
+        ) {
+            saw_motion = true;
+            break;
+        }
+    }
+    assert!(
+        saw_motion,
+        "se esperaba recibir algún evento de movimiento capturado"
+    );
 
     drop(handle);
+}
+
+#[test]
+#[ignore = "requiere un servidor X real (Xephyr/Xvfb) en $DISPLAY"]
+fn grab_ungrab_and_warp_do_not_error() {
+    let control = X11Control::connect().expect("la conexión de control no debería fallar");
+
+    control
+        .grab()
+        .expect("agarrar puntero+teclado no debería fallar");
+    control
+        .warp_to(50, 60)
+        .expect("mover el cursor real durante el grab no debería fallar");
+    control
+        .ungrab()
+        .expect("soltar el agarre no debería fallar");
+
+    // Tras soltar, el sistema debería volver a aceptar inyección normal.
+    let mut injector = X11Injector::connect().expect("XTEST debería estar disponible");
+    injector
+        .inject(&CapturedEvent::MouseMove { x: 5, y: 5 })
+        .expect("inyectar después de ungrab no debería fallar");
 }

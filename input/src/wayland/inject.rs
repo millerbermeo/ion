@@ -87,6 +87,8 @@ impl WaylandPortalInjector {
 
     async fn inject_async(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
         match *event {
+            // Solo tiene sentido del lado de captura; no hay nada que inyectar.
+            CapturedEvent::AbsolutePosition { .. } => Ok(()),
             CapturedEvent::MouseMove { x, y } => {
                 let (x, y) = (f64::from(x), f64::from(y));
                 let (dx, dy) = match self.last_position {
