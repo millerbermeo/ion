@@ -1,0 +1,179 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --bg-elevated: #ffffff;
+  --text: #1a1d21;
+  --text-muted: #6b7280;
+  --border: #e2e4e8;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --danger: #dc2626;
+  --success: #16a34a;
+}
+
+:root[data-theme="dark"] {
+  --bg: #15171a;
+  --bg-elevated: #1e2126;
+  --text: #e8eaed;
+  --text-muted: #9aa1ab;
+  --border: #2b2f36;
+  --accent: #5b8def;
+  --accent-contrast: #0b0d10;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a;
+    --bg-elevated: #1e2126;
+    --text: #e8eaed;
+    --text-muted: #9aa1ab;
+    --border: #2b2f36;
+    --accent: #5b8def;
+    --accent-contrast: #0b0d10;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", Ubuntu, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.titlebar__name {
+  font-weight: 600;
+}
+
+.icon-button {
+  background: none;
+  border: none;
+  font-size: 1.1rem;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.content {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+@media (max-width: 640px) {
+  .content {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem;
+}
+
+.panel h2 {
+  margin-top: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.device-list__empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.settings-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.settings-form label.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-form input,
+.settings-form select {
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.settings-form button {
+  align-self: flex-start;
+  padding: 0.5rem 1rem;
+  border-radius: 0.35rem;
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.save-status {
+  font-size: 0.85rem;
+  color: var(--success);
+}
+
+.statusbar {
+  display: flex;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.status--offline {
+  color: var(--danger);
+}
+
+.status--online {
+  color: var(--success);
+}

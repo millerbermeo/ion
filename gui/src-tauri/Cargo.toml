@@ -1,0 +1,23 @@
+[package]
+name = "ionconnect-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ionconnect-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+ionconnect-config = { version = "0.1.0", path = "../../config" }
+ionconnect-shared = { version = "0.1.0", path = "../../shared" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tauri = { version = "2.11.5", features = ["tray-icon"] }

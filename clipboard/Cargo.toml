@@ -1,0 +1,15 @@
+[package]
+name = "ionconnect-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["time", "sync", "macros", "rt"] }
+tracing = "0.1.44"

@@ -1,0 +1,28 @@
+[package]
+name = "ionconnect-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+futures-util = { version = "0.3.32", features = ["sink"] }
+ionconnect-crypto = { version = "0.1.0", path = "../crypto" }
+ionconnect-protocol = { version = "0.1.0", path = "../protocol" }
+ionconnect-shared = { version = "0.1.0", path = "../shared" }
+mdns-sd = "0.20.1"
+rand = "0.10.2"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }

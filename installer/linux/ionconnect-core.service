@@ -1,0 +1,20 @@
+[Unit]
+Description=IonConnect core (mouse/keyboard/clipboard sharing service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Placeholder: el binario `ionconnect-core` todavía no existe (no es una de
+# las fases numeradas 1-11 del roadmap, es la capa de orquestación final que
+# las conecta a todas). Esta unit queda lista para cuando exista.
+ExecStart=/usr/bin/ionconnect-core
+Restart=on-failure
+RestartSec=2
+# Servicio de usuario, no de sistema: corre con la sesión gráfica del
+# usuario (necesita acceso a X11/Wayland, XDG portals, D-Bus de sesión).
+# Instalar en ~/.config/systemd/user/, habilitar con:
+#   systemctl --user enable --now ionconnect-core.service
+
+[Install]
+WantedBy=default.target

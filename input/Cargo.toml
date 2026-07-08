@@ -1,0 +1,23 @@
+[package]
+name = "ionconnect-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ionconnect-protocol = { version = "0.1.0", path = "../protocol" }
+ionconnect-shared = { version = "0.1.0", path = "../shared" }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "macros", "net", "rt-multi-thread"] }
+tracing = "0.1.44"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ashpd = { version = "0.13.12", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+x11rb = { version = "0.13", features = ["xtest", "xinput"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IonConnect</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="titlebar">
+        <span class="titlebar__name">IonConnect</span>
+        <button id="theme-toggle" class="icon-button" title="Cambiar tema" type="button">🌓</button>
+      </header>
+
+      <main class="content">
+        <section class="panel">
+          <h2>Equipos</h2>
+          <ul id="device-list" class="device-list">
+            <li class="device-list__empty">Sin equipos conectados todavía.</li>
+          </ul>
+        </section>
+
+        <section class="panel">
+          <h2>Configuración</h2>
+          <form id="settings-form" class="settings-form">
+            <label>
+              Nombre de este equipo
+              <input type="text" id="device_name" name="device_name" required />
+            </label>
+            <label>
+              Puerto de escucha
+              <input type="number" id="listen_port" name="listen_port" min="1" max="65535" required />
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" id="discovery_enabled" name="discovery_enabled" />
+              Descubrimiento automático en la LAN (mDNS)
+            </label>
+            <label>
+              Emparejamiento
+              <select id="pairing_mode" name="pairing_mode">
+                <option value="reject-unknown">Rechazar equipos desconocidos</option>
+                <option value="auto-trust-on-first-use">Confiar automáticamente (solo primer uso)</option>
+              </select>
+            </label>
+            <label>
+              Nivel de log
+              <select id="log_level" name="log_level">
+                <option value="error">error</option>
+                <option value="warn">warn</option>
+                <option value="info">info</option>
+                <option value="debug">debug</option>
+                <option value="trace">trace</option>
+              </select>
+            </label>
+            <button type="submit">Guardar</button>
+            <span id="save-status" class="save-status" role="status"></span>
+          </form>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span id="connection-indicator" class="status status--offline">● sin conexiones</span>
+        <span id="latency-indicator" class="status">latencia: —</span>
+      </footer>
+    </div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

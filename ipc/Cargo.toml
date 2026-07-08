@@ -1,0 +1,17 @@
+[package]
+name = "ionconnect-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ionconnect-network = { version = "0.1.0", path = "../network" }
+ionconnect-protocol = { version = "0.1.0", path = "../protocol" }
+rand = "0.10.2"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["net", "io-util", "macros", "rt"] }
+tracing = "0.1.44"

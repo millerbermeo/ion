@@ -1,0 +1,16 @@
+[package]
+name = "ionconnect-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+ionconnect-shared = { version = "0.1.0", path = "../shared" }
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
