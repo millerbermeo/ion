@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,8 +8,8 @@ use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_network::{BackoffPolicy, Connection, connect_tls, connect_with_backoff};
-use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message};
-use ionconnect_shared::DeviceId;
+use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message, MouseButton};
+use ionconnect_shared::{DeviceId, KeyModifiers};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::client::TlsStream;
@@ -90,14 +91,95 @@ async fn run_single_session(
     session_loop(&mut conn, injector.as_mut(), &clipboard).await
 }
 
+/// Teclas y botones que este equipo inyectó como presionados y todavía no
+/// vio su liberación correspondiente. Si la sesión termina (conexión
+/// cortada, servidor que se cayó con el control activo, error de red) a
+/// mitad de una tecla u botón mantenido, sin esto se queda "pegado" a
+/// nivel de sistema operativo — p. ej. un modificador atascado hace que
+/// todo lo que se escriba después parezca no responder. `session_loop`
+/// garantiza [`Self::release_all`] al salir, pase lo que pase.
+#[derive(Default)]
+struct HeldInput {
+    keys: HashSet<u32>,
+    buttons: HashSet<MouseButton>,
+}
+
+impl HeldInput {
+    fn track(&mut self, event: &CapturedEvent) {
+        match *event {
+            CapturedEvent::Key {
+                keycode,
+                pressed: true,
+                ..
+            } => {
+                self.keys.insert(keycode);
+            }
+            CapturedEvent::Key {
+                keycode,
+                pressed: false,
+                ..
+            } => {
+                self.keys.remove(&keycode);
+            }
+            CapturedEvent::MouseButton {
+                button,
+                pressed: true,
+            } => {
+                self.buttons.insert(button);
+            }
+            CapturedEvent::MouseButton {
+                button,
+                pressed: false,
+            } => {
+                self.buttons.remove(&button);
+            }
+            CapturedEvent::MouseMove { .. } | CapturedEvent::AbsolutePosition { .. } => {}
+        }
+    }
+
+    fn release_all(&mut self, injector: &mut dyn InputInjector) {
+        for keycode in self.keys.drain() {
+            warn!(keycode, "liberando tecla que quedó pegada al cortarse la sesión");
+            let _ = injector.inject(&CapturedEvent::Key {
+                keycode,
+                modifiers: KeyModifiers::NONE,
+                pressed: false,
+            });
+        }
+        for button in self.buttons.drain() {
+            warn!(?button, "liberando botón que quedó pegado al cortarse la sesión");
+            let _ = injector.inject(&CapturedEvent::MouseButton {
+                button,
+                pressed: false,
+            });
+        }
+    }
+}
+
 /// El sondeo de portapapeles vive en el mismo `select!` que la recepción de
 /// red (en vez de una tarea aparte) porque ambos necesitan `conn`/`clipboard`
 /// a la vez: una tarea separada obligaría a repartir el `Connection` entre
 /// dos dueños, y `Connection` no está pensado para eso.
+///
+/// Sea cual sea el motivo de salida (desconexión limpia o error de red vía
+/// `?`), libera cualquier tecla/botón que haya quedado a medio presionar —
+/// ver [`HeldInput`].
 async fn session_loop(
     conn: &mut ClientConnection,
     injector: &mut dyn InputInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+) -> Result<(), CoreError> {
+    let mut held = HeldInput::default();
+    let result = session_loop_inner(conn, injector, clipboard, &mut held).await;
+    held.release_all(injector);
+    result
+}
+
+async fn session_loop_inner(
+    conn: &mut ClientConnection,
+    injector: &mut dyn InputInjector,
+    clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    held: &mut HeldInput,
 ) -> Result<(), CoreError> {
     let mut clipboard_ticker = tokio::time::interval(Duration::from_millis(500));
     loop {
@@ -108,13 +190,19 @@ async fn session_loop(
                         let _ = injector.inject(&CapturedEvent::MouseMove { x: m.x, y: m.y });
                     }
                     Some(Message::MouseClick(c)) => {
-                        let _ = injector.inject(&CapturedEvent::MouseButton { button: c.button, pressed: c.pressed });
+                        let event = CapturedEvent::MouseButton { button: c.button, pressed: c.pressed };
+                        held.track(&event);
+                        let _ = injector.inject(&event);
                     }
                     Some(Message::KeyboardPress(k)) => {
-                        let _ = injector.inject(&CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: true });
+                        let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: true };
+                        held.track(&event);
+                        let _ = injector.inject(&event);
                     }
                     Some(Message::KeyboardRelease(k)) => {
-                        let _ = injector.inject(&CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: false });
+                        let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: false };
+                        held.track(&event);
+                        let _ = injector.inject(&event);
                     }
                     Some(Message::ClipboardSync(sync)) => {
                         if let Ok(text) = String::from_utf8(sync.data) {
@@ -162,5 +250,95 @@ async fn create_injector() -> Result<Box<dyn InputInjector>, CoreError> {
         Err(CoreError::Other(
             "sistema operativo no soportado".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingInjector {
+        injected: Vec<CapturedEvent>,
+    }
+
+    impl InputInjector for RecordingInjector {
+        fn inject(&mut self, event: &CapturedEvent) -> Result<(), ionconnect_input::InputError> {
+            self.injected.push(*event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn release_all_is_a_noop_when_nothing_is_held() {
+        let mut held = HeldInput::default();
+        let mut injector = RecordingInjector::default();
+        held.release_all(&mut injector);
+        assert!(injector.injected.is_empty());
+    }
+
+    #[test]
+    fn tracks_and_releases_a_key_left_pressed() {
+        let mut held = HeldInput::default();
+        held.track(&CapturedEvent::Key {
+            keycode: 30,
+            modifiers: KeyModifiers::NONE,
+            pressed: true,
+        });
+
+        let mut injector = RecordingInjector::default();
+        held.release_all(&mut injector);
+
+        assert_eq!(
+            injector.injected,
+            vec![CapturedEvent::Key {
+                keycode: 30,
+                modifiers: KeyModifiers::NONE,
+                pressed: false,
+            }]
+        );
+        // Ya se liberó — un segundo `release_all` no debería mandar nada de nuevo.
+        let mut injector = RecordingInjector::default();
+        held.release_all(&mut injector);
+        assert!(injector.injected.is_empty());
+    }
+
+    #[test]
+    fn a_matching_release_clears_the_held_key_before_disconnect() {
+        let mut held = HeldInput::default();
+        held.track(&CapturedEvent::Key {
+            keycode: 30,
+            modifiers: KeyModifiers::NONE,
+            pressed: true,
+        });
+        held.track(&CapturedEvent::Key {
+            keycode: 30,
+            modifiers: KeyModifiers::NONE,
+            pressed: false,
+        });
+
+        let mut injector = RecordingInjector::default();
+        held.release_all(&mut injector);
+        assert!(injector.injected.is_empty());
+    }
+
+    #[test]
+    fn tracks_and_releases_a_held_mouse_button() {
+        let mut held = HeldInput::default();
+        held.track(&CapturedEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+
+        let mut injector = RecordingInjector::default();
+        held.release_all(&mut injector);
+
+        assert_eq!(
+            injector.injected,
+            vec![CapturedEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            }]
+        );
     }
 }

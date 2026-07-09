@@ -79,6 +79,20 @@ impl HandoffState {
         };
         Some(action)
     }
+
+    /// Fuerza la vuelta a `Local` si el control está actualmente cedido a
+    /// `device` — para cuando ese peer se desconectó o dejó de responder y
+    /// no hay forma de que dispare un cruce de borde normal. No hace nada
+    /// (devuelve `false`) si el control ya es local o está en otro
+    /// dispositivo, para no pisar un hand-off legítimo hacia otro peer.
+    pub fn reclaim_if_remote(&mut self, device: DeviceId) -> bool {
+        if self.active == Active::Remote(device) {
+            self.active = Active::Local;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +158,26 @@ mod tests {
             .expect("debería devolver el control");
         assert_eq!(action, HandoffAction::ReturnLocal { x: 1919, y: 300 });
         assert_eq!(state.active(), Active::Local);
+    }
+
+    #[test]
+    fn reclaim_if_remote_returns_to_local_only_for_the_active_device() {
+        let local = DeviceId::new();
+        let remote = DeviceId::new();
+        let other = DeviceId::new();
+        let mut state = HandoffState::new(layout_with_one_neighbor(local, remote), local);
+        state.on_position(1920, 540);
+        assert_eq!(state.active(), Active::Remote(remote));
+
+        // Un dispositivo que no es el activo no debería poder reclamar.
+        assert!(!state.reclaim_if_remote(other));
+        assert_eq!(state.active(), Active::Remote(remote));
+
+        assert!(state.reclaim_if_remote(remote));
+        assert_eq!(state.active(), Active::Local);
+
+        // Ya está local — no hay nada que reclamar.
+        assert!(!state.reclaim_if_remote(remote));
     }
 
     #[test]

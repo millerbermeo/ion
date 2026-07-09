@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ionconnect_input::wayland::{BarrierSpec, WaylandCaptureEvent, WaylandCaptureSession};
 use ionconnect_input::x11::{SharedPosition, X11Capture, X11Control};
@@ -57,6 +58,44 @@ pub fn run_x11_input_session(
 const POSITION_LOG_SAMPLE_RATE: u32 = 30;
 static POSITION_LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Si el control está cedido a un peer que ya no tiene conexión registrada
+/// en `routing` (se desconectó, crasheó, o se le mató el proceso), lo
+/// recupera localmente — sin esto, un peer que desaparece mientras tiene
+/// el control deja el mouse/teclado local muertos para siempre, porque
+/// nada vuelve a disparar un cruce de borde. Se llama en cada evento
+/// capturado, así que la detección es prácticamente instantánea mientras
+/// haya algo de actividad (mover el mouse alcanza).
+fn reclaim_if_peer_gone(
+    handoff: &Arc<Mutex<HandoffState>>,
+    control: &X11Control,
+    position: &SharedPosition,
+    routing: &Routing,
+) {
+    let device = match handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .active()
+    {
+        Active::Remote(device) => device,
+        Active::Local => return,
+    };
+    if routing.is_connected(device) {
+        return;
+    }
+    warn!(
+        %device,
+        "peer remoto desconectado con el control activo — recuperando control local"
+    );
+    let reclaimed = handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .reclaim_if_remote(device);
+    if reclaimed {
+        let (x, y) = position.get();
+        apply_handoff_action(HandoffAction::ReturnLocal { x, y }, control, position, routing);
+    }
+}
+
 fn handle_captured_event(
     event: CapturedEvent,
     handoff: &Arc<Mutex<HandoffState>>,
@@ -64,6 +103,7 @@ fn handle_captured_event(
     position: &SharedPosition,
     routing: &Routing,
 ) {
+    reclaim_if_peer_gone(handoff, control, position, routing);
     match event {
         CapturedEvent::AbsolutePosition { x, y } | CapturedEvent::MouseMove { x, y } => {
             if POSITION_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % POSITION_LOG_SAMPLE_RATE == 0
@@ -224,54 +264,31 @@ pub async fn run_wayland_input_session(
     let mut deactivated_stream = watcher.receive_deactivated().await?;
     let mut current_activation: Option<u32> = None;
 
+    // Red de seguridad para cuando el peer que tiene el control desaparece
+    // (crash, se le mata el proceso, se corta la red) sin que eso dispare
+    // un evento de captura — p. ej. si nadie está tocando el mouse en ese
+    // momento. Sin este tick, `next_event` se queda esperando para siempre
+    // y el control local nunca vuelve. Cada evento capturado también
+    // dispara el mismo chequeo (ver `handle_wayland_input`), así que en la
+    // práctica la recuperación es casi instantánea apenas hay actividad;
+    // esto solo cubre el caso de inactividad total.
+    let mut watchdog = tokio::time::interval(Duration::from_secs(1));
+
     loop {
-        let event = session
-            .next_event(&mut activated_stream, &mut deactivated_stream)
-            .await?;
-        match event {
-            WaylandCaptureEvent::Activated {
-                activation_id,
-                cursor,
-                ..
-            } => {
-                current_activation = activation_id;
-                let Some((x, y)) = cursor else {
-                    warn!("activación sin posición de cursor reportada, ignorando");
-                    continue;
-                };
-                #[allow(clippy::cast_possible_truncation)]
-                let (x, y) = (x as i32, y as i32);
-                info!(x, y, "captura Wayland activada");
-
-                let action = handoff
-                    .lock()
-                    .expect("el lock de handoff no debería estar envenenado")
-                    .on_position(x, y);
-
-                match action {
-                    Some(HandoffAction::ForwardTo { device, x, y }) => {
-                        info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
-                        session.reset_position(x, y);
-                        if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
-                            warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
-                        }
-                    }
-                    Some(HandoffAction::ReturnLocal { .. }) | None => {
-                        warn!(
-                            "activación sin hand-off válido (¿barrera sin vecino configurado en ese borde?), liberando"
-                        );
-                        let _ = session.release(current_activation, None).await;
-                        current_activation = None;
-                    }
-                }
+        tokio::select! {
+            _ = watchdog.tick() => {
+                reclaim_if_peer_gone_wayland(
+                    &handoff,
+                    &routing,
+                    &mut session,
+                    &mut current_activation,
+                )
+                .await;
             }
-            WaylandCaptureEvent::Deactivated { .. } => {
-                info!("captura Wayland desactivada");
-                current_activation = None;
-            }
-            WaylandCaptureEvent::Input(captured) => {
-                handle_wayland_input(
-                    captured,
+            event = session.next_event(&mut activated_stream, &mut deactivated_stream) => {
+                let event = event?;
+                handle_wayland_event(
+                    event,
                     &mut session,
                     &handoff,
                     &routing,
@@ -283,6 +300,91 @@ pub async fn run_wayland_input_session(
     }
 }
 
+async fn reclaim_if_peer_gone_wayland(
+    handoff: &Arc<Mutex<HandoffState>>,
+    routing: &Routing,
+    session: &mut WaylandCaptureSession,
+    current_activation: &mut Option<u32>,
+) {
+    let device = match handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .active()
+    {
+        Active::Remote(device) => device,
+        Active::Local => return,
+    };
+    if routing.is_connected(device) {
+        return;
+    }
+    warn!(
+        %device,
+        "peer remoto desconectado con el control activo (Wayland) — recuperando control local"
+    );
+    let reclaimed = handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .reclaim_if_remote(device);
+    if reclaimed {
+        let _ = session.release(*current_activation, None).await;
+        *current_activation = None;
+    }
+}
+
+async fn handle_wayland_event(
+    event: WaylandCaptureEvent,
+    session: &mut WaylandCaptureSession,
+    handoff: &Arc<Mutex<HandoffState>>,
+    routing: &Routing,
+    current_activation: &mut Option<u32>,
+) {
+    match event {
+        WaylandCaptureEvent::Activated {
+            activation_id,
+            cursor,
+            ..
+        } => {
+            *current_activation = activation_id;
+            let Some((x, y)) = cursor else {
+                warn!("activación sin posición de cursor reportada, ignorando");
+                return;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = (x as i32, y as i32);
+            info!(x, y, "captura Wayland activada");
+
+            let action = handoff
+                .lock()
+                .expect("el lock de handoff no debería estar envenenado")
+                .on_position(x, y);
+
+            match action {
+                Some(HandoffAction::ForwardTo { device, x, y }) => {
+                    info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
+                    session.reset_position(x, y);
+                    if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
+                        warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
+                    }
+                }
+                Some(HandoffAction::ReturnLocal { .. }) | None => {
+                    warn!(
+                        "activación sin hand-off válido (¿barrera sin vecino configurado en ese borde?), liberando"
+                    );
+                    let _ = session.release(*current_activation, None).await;
+                    *current_activation = None;
+                }
+            }
+        }
+        WaylandCaptureEvent::Deactivated { .. } => {
+            info!("captura Wayland desactivada");
+            *current_activation = None;
+        }
+        WaylandCaptureEvent::Input(captured) => {
+            handle_wayland_input(captured, session, handoff, routing, current_activation).await;
+        }
+    }
+}
+
 async fn handle_wayland_input(
     event: CapturedEvent,
     session: &mut WaylandCaptureSession,
@@ -290,6 +392,8 @@ async fn handle_wayland_input(
     routing: &Routing,
     current_activation: &mut Option<u32>,
 ) {
+    reclaim_if_peer_gone_wayland(handoff, routing, session, current_activation).await;
+
     let active = handoff
         .lock()
         .expect("el lock de handoff no debería estar envenenado")

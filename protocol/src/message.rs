@@ -63,7 +63,7 @@ pub struct MouseMove {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
     Left = 0,
     Right = 1,

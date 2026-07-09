@@ -35,6 +35,18 @@ impl Routing {
             .remove(&device);
     }
 
+    /// `true` si `device` tiene una conexión registrada en este momento —
+    /// usado por la sesión de captura para detectar que el peer al que le
+    /// cedió el control se desconectó, y así recuperar el control local en
+    /// vez de quedarse esperando para siempre a un peer que ya no existe.
+    #[must_use]
+    pub fn is_connected(&self, device: DeviceId) -> bool {
+        self.senders
+            .lock()
+            .expect("el lock de routing no debería estar envenenado")
+            .contains_key(&device)
+    }
+
     /// Intenta enviar `message` a `device`. `false` si no hay ninguna
     /// conexión activa para ese peer en este momento (ya se desconectó, o
     /// todavía no terminó de autenticarse).
