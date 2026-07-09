@@ -25,11 +25,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
     /// Envía un mensaje. Retorna cuando el mensaje ya fue entregado al
     /// socket subyacente (no implica que el peer lo haya procesado).
     ///
+    /// Toma `Message` por valor (no por referencia) a propósito: en el hot
+    /// path (reenvío de mouse/teclado) quien llama ya tiene un `Message`
+    /// propio recién sacado de un canal o recién construido — pedirlo por
+    /// referencia obligaría a clonarlo acá adentro en cada envío, cientos
+    /// de veces por segundo mientras el mouse está en movimiento.
+    ///
     /// # Errors
     ///
     /// Devuelve [`NetworkError`] si falla la codificación o la escritura.
-    pub async fn send(&mut self, message: &Message) -> Result<(), NetworkError> {
-        self.framed.send(message.clone()).await
+    pub async fn send(&mut self, message: Message) -> Result<(), NetworkError> {
+        self.framed.send(message).await
     }
 
     /// Espera el próximo mensaje. `Ok(None)` significa que el peer cerró la
@@ -61,7 +67,7 @@ mod tests {
             let (socket, _) = listener.accept().await.expect("accept debería funcionar");
             let mut conn = Connection::new(socket);
             let first = conn.recv().await.expect("recv no debería fallar");
-            conn.send(&Message::Heartbeat(Heartbeat { sequence: 7 }))
+            conn.send(Message::Heartbeat(Heartbeat { sequence: 7 }))
                 .await
                 .expect("send no debería fallar");
             first
@@ -73,7 +79,7 @@ mod tests {
                 .expect("connect debería funcionar"),
         );
         client
-            .send(&Message::MouseMove(MouseMove { x: 12, y: -8 }))
+            .send(Message::MouseMove(MouseMove { x: 12, y: -8 }))
             .await
             .expect("send no debería fallar");
         let reply = client

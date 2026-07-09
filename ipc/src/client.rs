@@ -62,7 +62,7 @@ mod tests {
             .await
             .expect("connect no debería fallar");
         client_conn
-            .send(&Message::Heartbeat(Heartbeat { sequence: 1 }))
+            .send(Message::Heartbeat(Heartbeat { sequence: 1 }))
             .await
             .expect("send no debería fallar");
 
@@ -103,7 +103,7 @@ mod tests {
             .await
             .expect("connect no debería fallar");
         client_conn
-            .send(&Message::Heartbeat(Heartbeat { sequence: 2 }))
+            .send(Message::Heartbeat(Heartbeat { sequence: 2 }))
             .await
             .expect("send no debería fallar");
 

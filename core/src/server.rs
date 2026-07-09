@@ -289,7 +289,7 @@ async fn handle_peer_connection(
         )));
     }
 
-    conn.send(&Message::Authentication(Authentication {
+    conn.send(Message::Authentication(Authentication {
         device_id: local_device,
         device_name,
         protocol_version: 1,
@@ -337,7 +337,7 @@ async fn handle_peer_connection(
                 }
             }
             Some(outgoing) = rx.recv() => {
-                conn.send(&outgoing).await?;
+                conn.send(outgoing).await?;
             }
         }
     }
@@ -453,7 +453,7 @@ mod tests {
             .await
             .expect("el handshake TLS del cliente debería completarse");
         client_conn
-            .send(&Message::Authentication(Authentication {
+            .send(Message::Authentication(Authentication {
                 device_id: client_device,
                 device_name: "cliente-de-prueba".to_string(),
                 protocol_version: 1,
@@ -482,7 +482,7 @@ mod tests {
         // ejemplo) — el servidor debería reemplazar la geometría asumida
         // por esta en vez de seguir con la copia de la suya propia.
         client_conn
-            .send(&Message::DisplayGeometry(
+            .send(Message::DisplayGeometry(
                 ionconnect_protocol::DisplayGeometry {
                     width: 1366,
                     height: 768,

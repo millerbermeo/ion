@@ -8,7 +8,7 @@ mod codec;
 mod error;
 mod message;
 
-pub use codec::{decode_message, encode_message};
+pub use codec::{decode_message, encode_message, encode_message_into};
 pub use error::ProtocolError;
 pub use message::{
     Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, Heartbeat,

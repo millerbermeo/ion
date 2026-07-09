@@ -23,6 +23,21 @@ use crate::message::{
 /// `Version`) falla.
 pub fn encode_message(message: &Message) -> Result<BytesMut, ProtocolError> {
     let mut buf = BytesMut::with_capacity(estimated_capacity(message));
+    encode_message_into(&mut buf, message)?;
+    Ok(buf)
+}
+
+/// Igual que [`encode_message`], pero escribe sobre un `BytesMut` que trae
+/// quien llama en vez de reservar uno nuevo — para el hot path de red
+/// (`network::MessageCodec`), que reutiliza el mismo buffer de scratch en
+/// cada mensaje saliente en vez de pedirle una allocación al heap a cada
+/// `MouseMove`/clic/tecla (cientos por segundo mientras el mouse está en
+/// movimiento).
+///
+/// # Errors
+///
+/// Mismos casos que [`encode_message`].
+pub fn encode_message_into(buf: &mut BytesMut, message: &Message) -> Result<(), ProtocolError> {
     buf.put_u8(message.message_type() as u8);
 
     match message {
@@ -47,15 +62,15 @@ pub fn encode_message(message: &Message) -> Result<BytesMut, ProtocolError> {
             buf.put_u32_le(*keycode);
             buf.put_u8(modifiers.bits());
         }
-        Message::ClipboardSync(payload) => encode_postcard(&mut buf, payload)?,
-        Message::Authentication(payload) => encode_postcard(&mut buf, payload)?,
-        Message::Disconnect(payload) => encode_postcard(&mut buf, payload)?,
-        Message::Reconnect(payload) => encode_postcard(&mut buf, payload)?,
-        Message::Version(payload) => encode_postcard(&mut buf, payload)?,
-        Message::DisplayGeometry(payload) => encode_postcard(&mut buf, payload)?,
+        Message::ClipboardSync(payload) => encode_postcard(buf, payload)?,
+        Message::Authentication(payload) => encode_postcard(buf, payload)?,
+        Message::Disconnect(payload) => encode_postcard(buf, payload)?,
+        Message::Reconnect(payload) => encode_postcard(buf, payload)?,
+        Message::Version(payload) => encode_postcard(buf, payload)?,
+        Message::DisplayGeometry(payload) => encode_postcard(buf, payload)?,
     }
 
-    Ok(buf)
+    Ok(())
 }
 
 /// Decodifica el payload ya desenmarcado de un mensaje.

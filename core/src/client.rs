@@ -71,7 +71,7 @@ async fn run_single_session(
 ) -> Result<(), CoreError> {
     let mut conn = connect_tls(address, client_config).await?;
 
-    conn.send(&Message::Authentication(Authentication {
+    conn.send(Message::Authentication(Authentication {
         device_id: local_device,
         device_name: settings.device_name.clone(),
         protocol_version: 1,
@@ -91,7 +91,7 @@ async fn run_single_session(
             height = geometry.height,
             "reportando resolución real al servidor"
         );
-        conn.send(&Message::DisplayGeometry(geometry)).await?;
+        conn.send(Message::DisplayGeometry(geometry)).await?;
     } else {
         warn!(
             "no se pudo detectar la resolución real de este equipo — el servidor va a asumir la suya propia"
@@ -270,7 +270,7 @@ async fn session_loop_inner(
             _ = clipboard_ticker.tick() => {
                 let changed = clipboard.lock().await.poll_once();
                 if let Ok(Some(text)) = changed {
-                    conn.send(&Message::ClipboardSync(ClipboardSync {
+                    conn.send(Message::ClipboardSync(ClipboardSync {
                         mime: ClipboardMime::Text,
                         data: text.into_bytes(),
                     })).await?;

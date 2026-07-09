@@ -101,7 +101,7 @@ mod tests {
             .await
             .expect("el handshake TLS del cliente debería completarse");
         client_conn
-            .send(&Message::MouseMove(MouseMove { x: 3, y: 4 }))
+            .send(Message::MouseMove(MouseMove { x: 3, y: 4 }))
             .await
             .expect("send no debería fallar");
 
