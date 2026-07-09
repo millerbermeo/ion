@@ -34,6 +34,26 @@ impl X11Control {
         Ok(Self { conn, root })
     }
 
+    /// Ancho/alto en píxeles de la pantalla raíz — en un `Xorg` con varios
+    /// monitores lado a lado (el caso normal en Linux, a diferencia de
+    /// Windows/macOS) esto ya es el escritorio virtual combinado completo,
+    /// sin necesitar la extensión `RandR`. Quien llama es responsable de
+    /// posicionarlo dentro de un [`ionconnect_screen::MonitorGeometry`]
+    /// (este crate no depende de `ionconnect-screen` a propósito).
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`InputError::X11Connection`] si no hay servidor X
+    /// disponible.
+    pub fn root_geometry() -> Result<(u32, u32), InputError> {
+        let (conn, screen_num) = x11rb::connect(None).map_err(x11_error)?;
+        let screen = &conn.setup().roots[screen_num];
+        Ok((
+            u32::from(screen.width_in_pixels),
+            u32::from(screen.height_in_pixels),
+        ))
+    }
+
     /// Agarra el puntero y el teclado exclusivamente para este cliente: a
     /// partir de este punto el resto del sistema deja de recibir eventos de
     /// entrada normales — es lo que hay que llamar justo al detectar un
