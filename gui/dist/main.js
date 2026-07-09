@@ -9,6 +9,27 @@ const EDGE_OPTIONS = [
 ];
 
 let peers = [];
+let coreRunning = false;
+
+const CORE_STATUS_LABELS = {
+  starting: "Iniciando…",
+  listening: "Escuchando conexiones…",
+  connected: "Conectado",
+  retrying: "Reintentando conexión…",
+  error: "Error — mirá el log",
+  stopped: "Detenido",
+};
+
+const CORE_STATUS_CLASSES = {
+  starting: "status--connecting",
+  listening: "status--online",
+  connected: "status--online",
+  retrying: "status--connecting",
+  error: "status--error",
+  stopped: "status--offline",
+};
+
+const CORE_RUNNING_STATUSES = new Set(["starting", "listening", "connected", "retrying", "error"]);
 
 function applyStoredTheme() {
   const stored = localStorage.getItem(THEME_STORAGE_KEY);
@@ -41,6 +62,49 @@ function updateRoleVisibility() {
   const role = document.getElementById("role").value;
   document.getElementById("client-fields").hidden = role !== "client";
   document.getElementById("server-fields").hidden = role !== "server";
+}
+
+function updateCoreToggleLabel() {
+  const role = document.getElementById("role").value;
+  const btn = document.getElementById("core-toggle");
+  btn.textContent = coreRunning ? "Detener" : role === "server" ? "Iniciar servidor" : "Conectar";
+}
+
+function setConnectionIndicator(status) {
+  const el = document.getElementById("connection-indicator");
+  const label = CORE_STATUS_LABELS[status] ?? "sin conexiones";
+  const cls = CORE_STATUS_CLASSES[status] ?? "status--offline";
+  el.className = `status ${cls}`;
+  el.textContent = `● ${label}`;
+}
+
+function appendCoreLog(line) {
+  const pre = document.getElementById("core-log-view");
+  const lines = `${pre.textContent}${line}\n`.split("\n");
+  pre.textContent = lines.slice(-200).join("\n");
+  pre.scrollTop = pre.scrollHeight;
+}
+
+async function toggleCore() {
+  const btn = document.getElementById("core-toggle");
+  btn.disabled = true;
+  try {
+    if (coreRunning) {
+      await invoke()("stop_core");
+      coreRunning = false;
+      setConnectionIndicator("stopped");
+    } else {
+      document.getElementById("core-log-view").textContent = "";
+      await invoke()("start_core");
+      coreRunning = true;
+      setConnectionIndicator("starting");
+    }
+  } catch (error) {
+    appendCoreLog(`[gui] ${error}`);
+  } finally {
+    btn.disabled = false;
+    updateCoreToggleLabel();
+  }
 }
 
 function renderPeers() {
@@ -114,6 +178,7 @@ async function loadSettings() {
   peers = (settings.peers ?? []).map((p) => ({ ...p }));
   renderPeers();
   updateRoleVisibility();
+  updateCoreToggleLabel();
 }
 
 async function saveSettings(event) {
@@ -164,9 +229,21 @@ window.addEventListener("DOMContentLoaded", () => {
   applyStoredTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   document.getElementById("copy-device-id").addEventListener("click", copyDeviceId);
-  document.getElementById("role").addEventListener("change", updateRoleVisibility);
+  document.getElementById("role").addEventListener("change", () => {
+    updateRoleVisibility();
+    updateCoreToggleLabel();
+  });
   document.getElementById("add-peer").addEventListener("click", addPeer);
   document.getElementById("settings-form").addEventListener("submit", saveSettings);
+  document.getElementById("core-toggle").addEventListener("click", toggleCore);
+
+  window.__TAURI__.event.listen("core-log", (event) => appendCoreLog(event.payload));
+  window.__TAURI__.event.listen("core-status", (event) => {
+    coreRunning = CORE_RUNNING_STATUSES.has(event.payload);
+    setConnectionIndicator(event.payload);
+    updateCoreToggleLabel();
+  });
+
   loadDeviceId();
   loadSettings();
   loadDevices();

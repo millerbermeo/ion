@@ -1,17 +1,20 @@
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Mutex;
 
 use ionconnect_config::Settings;
 
 use crate::identity;
 
-/// Estado compartido de la app Tauri. Por ahora solo maneja la
-/// configuración local; una vez exista el IPC con `core`, aquí vivirá
-/// también el cliente de esa conexión.
+/// Estado compartido de la app Tauri. Además de la configuración local,
+/// trackea el proceso hijo `ionconnect-core` cuando el usuario lo arranca
+/// desde el botón "Conectar" — vive solo en memoria, no sobrevive a un
+/// reinicio de la GUI.
 pub struct AppState {
     pub config_path: PathBuf,
     pub settings: Mutex<Settings>,
     pub device_id_hex: String,
+    pub core_child: Mutex<Option<Child>>,
 }
 
 impl AppState {
@@ -28,6 +31,7 @@ impl AppState {
             config_path,
             settings: Mutex::new(settings),
             device_id_hex,
+            core_child: Mutex::new(None),
         }
     }
 }

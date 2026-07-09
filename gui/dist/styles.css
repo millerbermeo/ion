@@ -184,6 +184,10 @@ body {
   border-radius: 0.35rem;
 }
 
+.role-fields[hidden] {
+  display: none;
+}
+
 .role-fields .hint {
   margin: 0;
   font-size: 0.8rem;
@@ -243,4 +247,54 @@ body {
 
 .status--online {
   color: var(--success);
+}
+
+.status--connecting {
+  color: var(--warning, #d97706);
+}
+
+.status--error {
+  color: var(--danger);
+}
+
+.core-control {
+  margin: 0.5rem 0 1rem;
+}
+
+#core-toggle {
+  padding: 0.5rem 1rem;
+  border-radius: 0.35rem;
+  border: none;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#core-toggle:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.core-log-details {
+  margin-bottom: 1rem;
+  font-size: 0.8rem;
+}
+
+.core-log-details summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.core-log {
+  margin: 0.5rem 0 0;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  white-space: pre-wrap;
 }
