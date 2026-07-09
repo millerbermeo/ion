@@ -6,12 +6,59 @@ use std::time::Duration;
 use ionconnect_input::wayland::{BarrierSpec, WaylandCaptureEvent, WaylandCaptureSession};
 use ionconnect_input::x11::{SharedPosition, X11Capture, X11Control};
 use ionconnect_input::{CapturedEvent, InputCapture as _, InputError};
-use ionconnect_protocol::{KeyboardPress, KeyboardRelease, Message, MouseClick, MouseMove};
+use ionconnect_protocol::{
+    KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick, MouseMove,
+};
 use ionconnect_shared::DeviceId;
 use tracing::{info, warn};
 
 use crate::handoff::{Active, HandoffAction, HandoffState};
 use crate::routing::Routing;
+
+/// Filtra pulsaciones/clics duplicados que a veces reporta la captura del
+/// sistema operativo para una sola acción física real (ver
+/// `ionconnect_input::x11::X11Capture` para el porqué puede pasar en X11).
+/// Se resuelve acá, del lado de `core`, en vez de ajustar qué eventos
+/// selecciona cada backend de captura — más robusto porque no depende de
+/// la semántica fina de cada plataforma, y funciona igual sin importar de
+/// dónde venga la duplicación.
+#[derive(Default)]
+struct HeldGuard {
+    keys: std::collections::HashSet<u32>,
+    buttons: std::collections::HashSet<MouseButton>,
+}
+
+impl HeldGuard {
+    /// `true` si `event` es una transición de estado nueva y hay que
+    /// procesarla; `false` si es un duplicado exacto del último reporte
+    /// para esa tecla/botón (un `pressed: true` repetido sin soltar antes,
+    /// o un `pressed: false` repetido sin haber estado presionado) y hay
+    /// que descartarlo en silencio. Siempre `true` para eventos que no son
+    /// de tecla/botón.
+    fn accept(&mut self, event: &CapturedEvent) -> bool {
+        match *event {
+            CapturedEvent::Key {
+                keycode,
+                pressed: true,
+                ..
+            } => self.keys.insert(keycode),
+            CapturedEvent::Key {
+                keycode,
+                pressed: false,
+                ..
+            } => self.keys.remove(&keycode),
+            CapturedEvent::MouseButton {
+                button,
+                pressed: true,
+            } => self.buttons.insert(button),
+            CapturedEvent::MouseButton {
+                button,
+                pressed: false,
+            } => self.buttons.remove(&button),
+            CapturedEvent::AbsolutePosition { .. } | CapturedEvent::MouseMove { .. } => true,
+        }
+    }
+}
 
 /// Corre la sesión de captura de entrada X11 en el hilo actual —
 /// **bloqueante**: llamar desde `tokio::task::spawn_blocking`, nunca
@@ -43,8 +90,9 @@ pub fn run_x11_input_session(
         }
     });
 
+    let mut held = HeldGuard::default();
     while let Ok(event) = rx.recv() {
-        handle_captured_event(event, handoff, &control, &position, routing);
+        handle_captured_event(event, handoff, &control, &position, routing, &mut held);
     }
 
     let _ = capture_thread.join();
@@ -108,6 +156,7 @@ fn handle_captured_event(
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
+    held: &mut HeldGuard,
 ) {
     reclaim_if_peer_gone(handoff, control, position, routing);
     match event {
@@ -119,6 +168,9 @@ fn handle_captured_event(
             handle_position_report(event, x, y, handoff, control, position, routing);
         }
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. } => {
+            if !held.accept(&event) {
+                return;
+            }
             info!(?event, "botón/tecla capturado");
             let active = handoff
                 .lock()
@@ -298,6 +350,7 @@ pub async fn run_wayland_input_session(
     let mut activated_stream = watcher.receive_activated().await?;
     let mut deactivated_stream = watcher.receive_deactivated().await?;
     let mut current_activation: Option<u32> = None;
+    let mut held = HeldGuard::default();
 
     // Red de seguridad para cuando el peer que tiene el control desaparece
     // (crash, se le mata el proceso, se corta la red) sin que eso dispare
@@ -328,6 +381,7 @@ pub async fn run_wayland_input_session(
                     &handoff,
                     &routing,
                     &mut current_activation,
+                    &mut held,
                 )
                 .await;
             }
@@ -372,6 +426,7 @@ async fn handle_wayland_event(
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Routing,
     current_activation: &mut Option<u32>,
+    held: &mut HeldGuard,
 ) {
     match event {
         WaylandCaptureEvent::Activated {
@@ -415,7 +470,8 @@ async fn handle_wayland_event(
             *current_activation = None;
         }
         WaylandCaptureEvent::Input(captured) => {
-            handle_wayland_input(captured, session, handoff, routing, current_activation).await;
+            handle_wayland_input(captured, session, handoff, routing, current_activation, held)
+                .await;
         }
     }
 }
@@ -426,8 +482,17 @@ async fn handle_wayland_input(
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Routing,
     current_activation: &mut Option<u32>,
+    held: &mut HeldGuard,
 ) {
     reclaim_if_peer_gone_wayland(handoff, routing, session, current_activation).await;
+
+    if matches!(
+        event,
+        CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. }
+    ) && !held.accept(&event)
+    {
+        return;
+    }
 
     let active = handoff
         .lock()
@@ -500,5 +565,77 @@ async fn handle_wayland_input(
             );
         }
         CapturedEvent::AbsolutePosition { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ionconnect_shared::KeyModifiers;
+
+    fn key(keycode: u32, pressed: bool) -> CapturedEvent {
+        CapturedEvent::Key {
+            keycode,
+            modifiers: KeyModifiers::NONE,
+            pressed,
+        }
+    }
+
+    #[test]
+    fn drops_a_press_reported_twice_without_a_release_in_between() {
+        let mut held = HeldGuard::default();
+        assert!(held.accept(&key(30, true)), "primera pulsación: nueva");
+        assert!(
+            !held.accept(&key(30, true)),
+            "segunda pulsación sin soltar antes: duplicado, se descarta"
+        );
+    }
+
+    #[test]
+    fn drops_a_release_reported_twice_without_a_press_in_between() {
+        let mut held = HeldGuard::default();
+        assert!(held.accept(&key(30, true)));
+        assert!(held.accept(&key(30, false)), "primer release: nuevo");
+        assert!(
+            !held.accept(&key(30, false)),
+            "segundo release sin volver a presionar: duplicado, se descarta"
+        );
+    }
+
+    #[test]
+    fn accepts_legitimate_repeated_taps_of_the_same_key() {
+        let mut held = HeldGuard::default();
+        // Tap, tap, tap — cada uno con su release intermedio, como escribir
+        // la misma letra varias veces seguidas. No debería filtrarse nada.
+        for _ in 0..3 {
+            assert!(held.accept(&key(30, true)));
+            assert!(held.accept(&key(30, false)));
+        }
+    }
+
+    #[test]
+    fn tracks_keys_and_buttons_independently() {
+        let mut held = HeldGuard::default();
+        assert!(held.accept(&key(30, true)));
+        assert!(held.accept(&CapturedEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }));
+        // El botón repetido se descarta; la tecla, ya soltada aparte, sigue
+        // pudiendo volver a presionarse — estados independientes.
+        assert!(!held.accept(&CapturedEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        }));
+        assert!(held.accept(&key(30, false)));
+        assert!(held.accept(&key(30, true)));
+    }
+
+    #[test]
+    fn always_accepts_motion_events() {
+        let mut held = HeldGuard::default();
+        assert!(held.accept(&CapturedEvent::MouseMove { x: 1, y: 1 }));
+        assert!(held.accept(&CapturedEvent::MouseMove { x: 1, y: 1 }));
+        assert!(held.accept(&CapturedEvent::AbsolutePosition { x: 1, y: 1 }));
     }
 }

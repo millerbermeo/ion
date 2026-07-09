@@ -18,12 +18,10 @@ fn x11_error(err: impl std::fmt::Display) -> InputError {
     InputError::X11Connection(err.to_string())
 }
 
-/// El protocolo XI2 identifica "todos los dispositivos" (maestros +
-/// esclavos) con el id 0, y "todos los maestros" con el id 1 — no hay
-/// constantes nombradas para esto en `x11rb`; son valores fijos de la
-/// especificación `XInput2`, sección 4.
+/// El protocolo XI2 identifica "todos los dispositivos" con el id 0 (no hay
+/// una constante nombrada para esto en `x11rb`; es un valor fijo de la
+/// especificación `XInput2`, sección 4).
 const XI_ALL_DEVICES: u16 = 0;
-const XI_ALL_MASTER_DEVICES: u16 = 1;
 
 /// Posición acumulada compartida entre el hilo de captura (que la actualiza
 /// a partir de deltas crudos) y quien orquesta la sesión (que la reinicia
@@ -113,37 +111,31 @@ impl X11Capture {
             .reply()
             .map_err(x11_error)?;
 
-        // Dos selecciones separadas, a propósito — mezclarlas en una sola
-        // con `deviceid: XI_ALL_DEVICES` duplica cada tecla/clic (probado
-        // con `xinput test-xi2`: una pulsación entrega un `KeyPress` desde
-        // el dispositivo *maestro* Y otro desde el *esclavo* que lo generó,
-        // porque seleccionar sobre "todos los dispositivos" para eventos
-        // cocidos se registra en maestro y esclavo a la vez):
-        //
-        // - Cocidos (`MOTION`/`KEY_PRESS`/`KEY_RELEASE`/`BUTTON_PRESS`/
-        //   `BUTTON_RELEASE`) solo en `XI_ALL_MASTER_DEVICES`: el maestro ya
-        //   entrega un único evento por pulsación/clic real sin importar
-        //   cuántos esclavos físicos tenga detrás.
-        // - `RAW_MOTION` solo lo generan los esclavos (los maestros no
-        //   tienen eventos crudos propios), así que se queda en
-        //   `XI_ALL_DEVICES` — necesario para seguir viendo deltas más allá
-        //   del borde una vez agarrado y confinado el puntero (ver
-        //   documentación de `X11Capture` arriba).
-        let cooked_mask = XIEventMask::MOTION
-            | XIEventMask::BUTTON_PRESS
-            | XIEventMask::BUTTON_RELEASE
-            | XIEventMask::KEY_PRESS
-            | XIEventMask::KEY_RELEASE;
-        let events = [
-            EventMask {
-                deviceid: XI_ALL_MASTER_DEVICES,
-                mask: vec![cooked_mask],
-            },
-            EventMask {
-                deviceid: XI_ALL_DEVICES,
-                mask: vec![XIEventMask::RAW_MOTION],
-            },
-        ];
+        // Botones/teclas van en su variante `RAW_*`, igual que el
+        // movimiento — a propósito, aunque eso puede reportar una pulsación
+        // duplicada en algunos casos (ver `core::input_session::HeldGuard`,
+        // que la absorbe del lado de `core`). Se probó seleccionar la
+        // variante "cocida" (`KEY_PRESS`/`BUTTON_PRESS`) solo en el
+        // dispositivo maestro para evitar esa duplicación, pero rompió la
+        // captura por completo en un escritorio real: los eventos cocidos
+        // siguen la propagación normal de ventanas por foco, así que una
+        // vez que cualquier aplicación enfocada los consume (algo que pasa
+        // todo el tiempo en un escritorio real, a diferencia de una sesión
+        // Xephyr vacía), nunca llegan a nuestra selección sobre el root.
+        // Los eventos `RAW_*` no tienen ese problema — se entregan sin
+        // importar foco ni grabs, que es justamente por lo que ya se usaba
+        // `RAW_MOTION` para seguir viendo el mouse más allá del borde una
+        // vez agarrado y confinado el puntero.
+        let mask = XIEventMask::MOTION
+            | XIEventMask::RAW_MOTION
+            | XIEventMask::RAW_BUTTON_PRESS
+            | XIEventMask::RAW_BUTTON_RELEASE
+            | XIEventMask::RAW_KEY_PRESS
+            | XIEventMask::RAW_KEY_RELEASE;
+        let events = [EventMask {
+            deviceid: XI_ALL_DEVICES,
+            mask: vec![mask],
+        }];
         conn.xinput_xi_select_events(root, &events)
             .map_err(x11_error)?
             .check()
@@ -179,24 +171,24 @@ impl InputCapture for X11Capture {
                         .add(clamp_delta_to_i32(dx), clamp_delta_to_i32(dy));
                     Some(CapturedEvent::MouseMove { x, y })
                 }
-                Event::XinputButtonPress(ev) => {
+                Event::XinputRawButtonPress(ev) => {
                     button_from_code(ev.detail).map(|button| CapturedEvent::MouseButton {
                         button,
                         pressed: true,
                     })
                 }
-                Event::XinputButtonRelease(ev) => {
+                Event::XinputRawButtonRelease(ev) => {
                     button_from_code(ev.detail).map(|button| CapturedEvent::MouseButton {
                         button,
                         pressed: false,
                     })
                 }
-                Event::XinputKeyPress(ev) => Some(CapturedEvent::Key {
+                Event::XinputRawKeyPress(ev) => Some(CapturedEvent::Key {
                     keycode: x11_keycode_to_evdev(ev.detail),
                     modifiers: KeyModifiers::NONE,
                     pressed: true,
                 }),
-                Event::XinputKeyRelease(ev) => Some(CapturedEvent::Key {
+                Event::XinputRawKeyRelease(ev) => Some(CapturedEvent::Key {
                     keycode: x11_keycode_to_evdev(ev.detail),
                     modifiers: KeyModifiers::NONE,
                     pressed: false,
