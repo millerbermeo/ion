@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +49,13 @@ pub fn run_x11_input_session(
     Ok(())
 }
 
+/// Cuántos reportes de posición saltear entre cada línea de log — a la
+/// tasa normal de un mouse (cientos de eventos/s) loguear todos inundaría
+/// el panel de la GUI; cada ~30 alcanza para confirmar en vivo que la
+/// captura sigue viva sin ahogar el resto del log.
+const POSITION_LOG_SAMPLE_RATE: u32 = 30;
+static POSITION_LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 fn handle_captured_event(
     event: CapturedEvent,
     handoff: &Arc<Mutex<HandoffState>>,
@@ -57,15 +65,22 @@ fn handle_captured_event(
 ) {
     match event {
         CapturedEvent::AbsolutePosition { x, y } | CapturedEvent::MouseMove { x, y } => {
+            if POSITION_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % POSITION_LOG_SAMPLE_RATE == 0
+            {
+                info!(x, y, ?event, "posición de mouse capturada");
+            }
             handle_position_report(event, x, y, handoff, control, position, routing);
         }
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. } => {
+            info!(?event, "botón/tecla capturado");
             let active = handoff
                 .lock()
                 .expect("el lock de handoff no debería estar envenenado")
                 .active();
             if let Active::Remote(device) = active {
                 forward_button_or_key(event, device, position, routing);
+            } else {
+                info!("botón/tecla no reenviado: control sigue local");
             }
         }
     }
