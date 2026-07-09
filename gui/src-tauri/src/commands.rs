@@ -4,7 +4,12 @@ use std::process::{Command, Stdio};
 
 use ionconnect_config::Settings;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Cuántas líneas de log de `core` se retienen en memoria para
+/// `get_core_snapshot` — suficiente para diagnosticar sin crecer sin límite
+/// en una sesión larga.
+const CORE_LOG_CAPACITY: usize = 500;
 
 use crate::state::AppState;
 
@@ -94,14 +99,29 @@ fn classify_line(line: &str) -> Option<&'static str> {
     }
 }
 
+/// Lee `reader` línea a línea en un hilo dedicado y la vuelca en
+/// `AppState::core_log`/`core_status` (fuente de verdad, leída por
+/// polling desde la GUI) y además la emite como evento (`core-log`,
+/// `core-status`) por si el frontend quiere reaccionar al instante.
 fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
     std::thread::spawn(move || {
         let buf = BufReader::new(reader);
         for line in buf.lines().map_while(Result::ok) {
-            let _ = app.emit("core-log", &line);
+            let state = app.state::<AppState>();
+            if let Ok(mut log) = state.core_log.lock() {
+                log.push(line.clone());
+                let overflow = log.len().saturating_sub(CORE_LOG_CAPACITY);
+                if overflow > 0 {
+                    log.drain(0..overflow);
+                }
+            }
             if let Some(status) = classify_line(&line) {
+                if let Ok(mut current) = state.core_status.lock() {
+                    *current = status.to_string();
+                }
                 let _ = app.emit("core-status", status);
             }
+            let _ = app.emit("core-log", &line);
         }
     });
 }
@@ -135,6 +155,15 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
         stream_output(app.clone(), stderr);
     }
 
+    state
+        .core_log
+        .lock()
+        .expect("el lock del log no debería estar envenenado")
+        .clear();
+    *state
+        .core_status
+        .lock()
+        .expect("el lock de estado no debería estar envenenado") = "starting".to_string();
     let _ = app.emit("core-status", "starting");
     *guard = Some(child);
     Ok(())
@@ -152,9 +181,48 @@ pub fn stop_core(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         Some(mut child) => {
             child.kill().map_err(|e| e.to_string())?;
             let _ = child.wait();
+            *state
+                .core_status
+                .lock()
+                .expect("el lock de estado no debería estar envenenado") = "stopped".to_string();
             let _ = app.emit("core-status", "stopped");
             Ok(())
         }
         None => Err("ionconnect-core no está corriendo".to_string()),
+    }
+}
+
+/// Foto del estado actual de `ionconnect-core`: si está corriendo, su
+/// último estado derivado, y el log acumulado desde el último
+/// [`start_core`]. Pensado para *polling* desde la GUI — es la fuente de
+/// verdad, no depende de que los eventos hayan llegado bien al frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreSnapshot {
+    pub running: bool,
+    pub status: String,
+    pub log: Vec<String>,
+}
+
+#[tauri::command]
+pub fn get_core_snapshot(state: State<AppState>) -> CoreSnapshot {
+    let running = state
+        .core_child
+        .lock()
+        .expect("el lock del proceso core no debería estar envenenado")
+        .is_some();
+    let status = state
+        .core_status
+        .lock()
+        .expect("el lock de estado no debería estar envenenado")
+        .clone();
+    let log = state
+        .core_log
+        .lock()
+        .expect("el lock del log no debería estar envenenado")
+        .clone();
+    CoreSnapshot {
+        running,
+        status,
+        log,
     }
 }

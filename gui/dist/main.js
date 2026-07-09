@@ -29,7 +29,7 @@ const CORE_STATUS_CLASSES = {
   stopped: "status--offline",
 };
 
-const CORE_RUNNING_STATUSES = new Set(["starting", "listening", "connected", "retrying", "error"]);
+let corePollTimer = null;
 
 function applyStoredTheme() {
   const stored = localStorage.getItem(THEME_STORAGE_KEY);
@@ -78,11 +78,37 @@ function setConnectionIndicator(status) {
   el.textContent = `● ${label}`;
 }
 
-function appendCoreLog(line) {
+function setCoreLog(lines) {
   const pre = document.getElementById("core-log-view");
-  const lines = `${pre.textContent}${line}\n`.split("\n");
-  pre.textContent = lines.slice(-200).join("\n");
-  pre.scrollTop = pre.scrollHeight;
+  const text = lines.join("\n");
+  if (pre.textContent === text) return;
+  const wasScrolledToBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.textContent = text;
+  if (wasScrolledToBottom) {
+    pre.scrollTop = pre.scrollHeight;
+  }
+}
+
+/// Única fuente de verdad para el estado de `core`: no confiamos en que
+/// los eventos hayan llegado bien al webview, así que consultamos
+/// `get_core_snapshot` cada segundo y pintamos lo que diga el backend.
+async function pollCoreSnapshot() {
+  try {
+    const snapshot = await invoke()("get_core_snapshot");
+    coreRunning = snapshot.running;
+    setConnectionIndicator(snapshot.running ? snapshot.status : "stopped");
+    setCoreLog(snapshot.log);
+    updateCoreToggleLabel();
+  } catch {
+    // get_core_snapshot no debería fallar nunca; si pasa, seguimos
+    // sondeando en el próximo tick en vez de romper el polling.
+  }
+}
+
+function startCorePolling() {
+  if (corePollTimer) return;
+  pollCoreSnapshot();
+  corePollTimer = setInterval(pollCoreSnapshot, 1000);
 }
 
 async function toggleCore() {
@@ -91,19 +117,14 @@ async function toggleCore() {
   try {
     if (coreRunning) {
       await invoke()("stop_core");
-      coreRunning = false;
-      setConnectionIndicator("stopped");
     } else {
-      document.getElementById("core-log-view").textContent = "";
       await invoke()("start_core");
-      coreRunning = true;
-      setConnectionIndicator("starting");
     }
   } catch (error) {
-    appendCoreLog(`[gui] ${error}`);
+    setCoreLog([`[gui] ${error}`]);
   } finally {
+    await pollCoreSnapshot();
     btn.disabled = false;
-    updateCoreToggleLabel();
   }
 }
 
@@ -237,12 +258,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("settings-form").addEventListener("submit", saveSettings);
   document.getElementById("core-toggle").addEventListener("click", toggleCore);
 
-  window.__TAURI__.event.listen("core-log", (event) => appendCoreLog(event.payload));
-  window.__TAURI__.event.listen("core-status", (event) => {
-    coreRunning = CORE_RUNNING_STATUSES.has(event.payload);
-    setConnectionIndicator(event.payload);
-    updateCoreToggleLabel();
-  });
+  startCorePolling();
 
   loadDeviceId();
   loadSettings();

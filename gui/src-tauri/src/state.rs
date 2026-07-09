@@ -10,11 +10,18 @@ use crate::identity;
 /// trackea el proceso hijo `ionconnect-core` cuando el usuario lo arranca
 /// desde el botón "Conectar" — vive solo en memoria, no sobrevive a un
 /// reinicio de la GUI.
+///
+/// `core_log`/`core_status` son la fuente de verdad que lee la GUI por
+/// *polling* (`get_core_snapshot`) en vez de depender únicamente de los
+/// eventos que emiten los hilos lectores — así el estado mostrado es
+/// correcto incluso si algo en el bus de eventos del webview falla.
 pub struct AppState {
     pub config_path: PathBuf,
     pub settings: Mutex<Settings>,
     pub device_id_hex: String,
     pub core_child: Mutex<Option<Child>>,
+    pub core_log: Mutex<Vec<String>>,
+    pub core_status: Mutex<String>,
 }
 
 impl AppState {
@@ -32,6 +39,8 @@ impl AppState {
             settings: Mutex::new(settings),
             device_id_hex,
             core_child: Mutex::new(None),
+            core_log: Mutex::new(Vec::new()),
+            core_status: Mutex::new("stopped".to_string()),
         }
     }
 }

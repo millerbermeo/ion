@@ -20,6 +20,7 @@ fn main() {
             commands::list_devices,
             commands::start_core,
             commands::stop_core,
+            commands::get_core_snapshot,
         ])
         .setup(|app| {
             if let Some(icon) = app.default_window_icon().cloned() {
