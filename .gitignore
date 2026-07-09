@@ -3,3 +3,5 @@
 .DS_Store
 Thumbs.db
 *.pdb
+/gui/src-tauri/gen/
+.claude/
