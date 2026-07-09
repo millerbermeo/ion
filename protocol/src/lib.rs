@@ -11,6 +11,7 @@ mod message;
 pub use codec::{decode_message, encode_message};
 pub use error::ProtocolError;
 pub use message::{
-    Authentication, ClipboardMime, ClipboardSync, Disconnect, Heartbeat, KeyboardPress,
-    KeyboardRelease, Message, MessageType, MouseButton, MouseClick, MouseMove, Reconnect, Version,
+    Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, Heartbeat,
+    KeyboardPress, KeyboardRelease, Message, MessageType, MouseButton, MouseClick, MouseMove,
+    Reconnect, Version,
 };

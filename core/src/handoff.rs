@@ -1,4 +1,4 @@
-use ionconnect_screen::Layout;
+use ionconnect_screen::{Layout, VirtualDesktop};
 use ionconnect_shared::DeviceId;
 
 /// A quién pertenece el control del mouse/teclado en este instante.
@@ -92,6 +92,25 @@ impl HandoffState {
         } else {
             false
         }
+    }
+
+    /// Reemplaza la geometría asumida de `device` por su resolución real,
+    /// una vez que la reporta (ver `Message::DisplayGeometry` en
+    /// `core::client`). Antes de que eso llegue —o si el peer es viejo y
+    /// nunca lo manda— sigue vigente la copia de la geometría local con la
+    /// que se armó el `Layout` al arrancar; esto solo la actualiza en
+    /// caliente cuando hay un valor real disponible. Se puede llamar en
+    /// cualquier momento, incluso con `device` ya activo.
+    pub fn update_peer_geometry(&mut self, device: DeviceId, desktop: VirtualDesktop) {
+        self.layout.set_desktop(device, desktop);
+    }
+
+    /// Límites del escritorio virtual asumido para `device` en este
+    /// momento — para debug/tests y para que la GUI pueda mostrar si ya
+    /// llegó la resolución real de un peer o todavía es la copia inicial.
+    #[must_use]
+    pub fn peer_bounds(&self, device: DeviceId) -> Option<ionconnect_screen::MonitorGeometry> {
+        self.layout.desktop(device).and_then(VirtualDesktop::bounds)
     }
 
     /// Ajusta `(x, y)` para que caiga dentro del escritorio virtual del

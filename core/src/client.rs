@@ -8,7 +8,9 @@ use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_network::{BackoffPolicy, Connection, connect_tls, connect_with_backoff};
-use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message, MouseButton};
+use ionconnect_protocol::{
+    Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton,
+};
 use ionconnect_shared::{DeviceId, KeyModifiers};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
@@ -83,12 +85,63 @@ async fn run_single_session(
     };
     info!(server = %server_auth.device_name, "conectado al servidor");
 
+    if let Some(geometry) = local_display_geometry() {
+        info!(
+            width = geometry.width,
+            height = geometry.height,
+            "reportando resolución real al servidor"
+        );
+        conn.send(&Message::DisplayGeometry(geometry)).await?;
+    } else {
+        warn!(
+            "no se pudo detectar la resolución real de este equipo — el servidor va a asumir la suya propia"
+        );
+    }
+
     let mut injector = create_injector().await?;
     let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
     session_loop(&mut conn, injector.as_mut(), &clipboard).await
+}
+
+/// Resolución real del escritorio virtual de este equipo, para que el
+/// servidor calcule bien dónde reaparece el cursor en vez de asumir que
+/// el cliente tiene la misma resolución que él (ver
+/// `ionconnect_screen`/`crate::handoff::HandoffState::clamp_to_active_desktop`
+/// para el porqué importa). `None` si no se pudo detectar — el servidor
+/// sigue funcionando igual que antes de que existiera este mensaje.
+fn local_display_geometry() -> Option<DisplayGeometry> {
+    #[cfg(windows)]
+    {
+        let (_, _, width, height) = ionconnect_input::win32::virtual_screen_geometry();
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        return Some(DisplayGeometry {
+            width: width as u32,
+            height: height as u32,
+        });
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // El portal `RemoteDesktop` que usa el cliente Wayland no expone
+        // todavía una forma barata de consultar la geometría real (a
+        // diferencia del portal `InputCapture` del lado servidor, que sí
+        // tiene `zones()`) — se deja para cuando haga falta en vez de
+        // pedir un permiso extra solo para esto.
+        let is_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
+        if is_wayland {
+            return None;
+        }
+        return ionconnect_input::x11::X11Control::root_geometry()
+            .ok()
+            .map(|(width, height)| DisplayGeometry { width, height });
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Teclas y botones que este equipo inyectó como presionados y todavía no

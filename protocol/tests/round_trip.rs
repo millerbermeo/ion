@@ -1,7 +1,7 @@
 use ionconnect_protocol::{
-    Authentication, ClipboardMime, ClipboardSync, Disconnect, Heartbeat, KeyboardPress,
-    KeyboardRelease, Message, MouseButton, MouseClick, MouseMove, Reconnect, Version,
-    decode_message, encode_message,
+    Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, Heartbeat,
+    KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick, MouseMove, Reconnect,
+    Version, decode_message, encode_message,
 };
 use ionconnect_shared::{DeviceId, KeyModifiers};
 
@@ -83,6 +83,14 @@ fn version_round_trips() {
         major: 1,
         minor: 2,
         patch: 3,
+    }));
+}
+
+#[test]
+fn display_geometry_round_trips() {
+    assert_round_trips(&Message::DisplayGeometry(DisplayGeometry {
+        width: 1366,
+        height: 768,
     }));
 }
 

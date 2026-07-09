@@ -52,6 +52,7 @@ pub fn encode_message(message: &Message) -> Result<BytesMut, ProtocolError> {
         Message::Disconnect(payload) => encode_postcard(&mut buf, payload)?,
         Message::Reconnect(payload) => encode_postcard(&mut buf, payload)?,
         Message::Version(payload) => encode_postcard(&mut buf, payload)?,
+        Message::DisplayGeometry(payload) => encode_postcard(&mut buf, payload)?,
     }
 
     Ok(buf)
@@ -121,6 +122,9 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::Disconnect => Ok(Message::Disconnect(postcard::from_bytes(buf)?)),
         MessageType::Reconnect => Ok(Message::Reconnect(postcard::from_bytes(buf)?)),
         MessageType::Version => Ok(Message::Version(postcard::from_bytes(buf)?)),
+        MessageType::DisplayGeometry => {
+            Ok(Message::DisplayGeometry(postcard::from_bytes(buf)?))
+        }
     }
 }
 
@@ -152,5 +156,6 @@ const fn estimated_capacity(message: &Message) -> usize {
         Message::Authentication(_) => 96,
         Message::Disconnect(_) => 32,
         Message::Version(_) => 7,
+        Message::DisplayGeometry(_) => 9,
     }
 }

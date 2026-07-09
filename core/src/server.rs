@@ -129,6 +129,7 @@ pub async fn run_server(
         Arc::new(known_peers),
         routing.clone(),
         clipboard,
+        handoff.clone(),
     ));
 
     match backend {
@@ -181,6 +182,7 @@ async fn propagate_task(handle: tokio::task::JoinHandle<Result<(), CoreError>>) 
         .map_err(|e| CoreError::Other(e.to_string()))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_connections(
     listener: TcpListener,
     server_config: Arc<rustls::ServerConfig>,
@@ -189,6 +191,7 @@ async fn accept_connections(
     known_peers: Arc<HashMap<DeviceId, String>>,
     routing: Arc<Routing>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
 ) -> Result<(), CoreError> {
     loop {
         let (tcp, addr) = listener.accept().await?;
@@ -197,6 +200,7 @@ async fn accept_connections(
         let routing = routing.clone();
         let clipboard = clipboard.clone();
         let device_name = device_name.clone();
+        let handoff = handoff.clone();
 
         tokio::spawn(async move {
             let result = handle_peer_connection(
@@ -207,6 +211,7 @@ async fn accept_connections(
                 known_peers,
                 routing,
                 clipboard,
+                handoff,
             )
             .await;
             if let Err(err) = result {
@@ -268,6 +273,7 @@ async fn handle_peer_connection(
     known_peers: Arc<HashMap<DeviceId, String>>,
     routing: Arc<Routing>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
 ) -> Result<(), CoreError> {
     let mut conn = accept_tls(tcp, server_config).await?;
 
@@ -305,6 +311,26 @@ async fn handle_peer_connection(
                             let mut guard = clipboard.lock().await;
                             let _ = guard.apply_remote_change(text);
                         }
+                    }
+                    Some(Message::DisplayGeometry(geometry)) => {
+                        info!(
+                            device_id = %auth.device_id,
+                            width = geometry.width,
+                            height = geometry.height,
+                            "resolución real del peer recibida"
+                        );
+                        handoff
+                            .lock()
+                            .expect("el lock de handoff no debería estar envenenado")
+                            .update_peer_geometry(
+                                auth.device_id,
+                                VirtualDesktop::new(vec![MonitorGeometry::new(
+                                    0,
+                                    0,
+                                    geometry.width,
+                                    geometry.height,
+                                )]),
+                            );
                     }
                     Some(Message::Disconnect(_)) | None => break,
                     _ => {}
@@ -394,12 +420,17 @@ mod tests {
         let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
             ArboardProvider::new().expect("abrir el portapapeles no debería fallar"),
         )));
+        let handoff = Arc::new(std::sync::Mutex::new(crate::handoff::HandoffState::new(
+            Layout::new(),
+            server_device,
+        )));
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind no debería fallar");
         let addr = listener.local_addr().expect("dirección local esperada");
 
+        let handoff_check = handoff.clone();
         let server_task = tokio::spawn({
             let routing = routing.clone();
             async move {
@@ -412,6 +443,7 @@ mod tests {
                     Arc::new(known_peers),
                     routing,
                     clipboard,
+                    handoff,
                 )
                 .await
             }
@@ -445,6 +477,35 @@ mod tests {
             .expect("recv no debería fallar")
             .expect("se esperaba un mensaje reenviado");
         assert_eq!(received, Message::MouseMove(MouseMove { x: 42, y: 7 }));
+
+        // El cliente reporta su resolución real (portátil chico, por
+        // ejemplo) — el servidor debería reemplazar la geometría asumida
+        // por esta en vez de seguir con la copia de la suya propia.
+        client_conn
+            .send(&Message::DisplayGeometry(
+                ionconnect_protocol::DisplayGeometry {
+                    width: 1366,
+                    height: 768,
+                },
+            ))
+            .await
+            .expect("enviar DisplayGeometry no debería fallar");
+
+        let bounds = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(bounds) = handoff_check
+                    .lock()
+                    .expect("el lock de handoff no debería estar envenenado")
+                    .peer_bounds(client_device)
+                {
+                    return bounds;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("el servidor debería haber procesado DisplayGeometry a tiempo");
+        assert_eq!(bounds, MonitorGeometry::new(0, 0, 1366, 768));
 
         drop(client_conn);
         let _ = server_task.await;

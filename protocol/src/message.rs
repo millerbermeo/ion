@@ -21,6 +21,7 @@ pub enum MessageType {
     Disconnect = 7,
     Reconnect = 8,
     Version = 9,
+    DisplayGeometry = 10,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -38,6 +39,7 @@ impl TryFrom<u8> for MessageType {
             7 => Ok(Self::Disconnect),
             8 => Ok(Self::Reconnect),
             9 => Ok(Self::Version),
+            10 => Ok(Self::DisplayGeometry),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -154,6 +156,19 @@ pub struct Version {
     pub patch: u16,
 }
 
+/// Tamaño real del escritorio virtual del emisor — lo manda el cliente al
+/// conectarse (y de nuevo si cambia, p. ej. un monitor externo que se
+/// conecta/desconecta) para que el servidor deje de asumir que tiene la
+/// misma resolución que él al calcular dónde reaparece el cursor en un
+/// hand-off. Origen siempre `(0, 0)`: alcanza para el caso común de un
+/// cliente de un solo monitor; multi-monitor en el cliente queda para
+/// cuando haga falta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayGeometry {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Envoltura de todos los tipos de mensaje del protocolo `IonConnect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -167,6 +182,7 @@ pub enum Message {
     Disconnect(Disconnect),
     Reconnect(Reconnect),
     Version(Version),
+    DisplayGeometry(DisplayGeometry),
 }
 
 impl Message {
@@ -183,6 +199,7 @@ impl Message {
             Self::Disconnect(_) => MessageType::Disconnect,
             Self::Reconnect(_) => MessageType::Reconnect,
             Self::Version(_) => MessageType::Version,
+            Self::DisplayGeometry(_) => MessageType::DisplayGeometry,
         }
     }
 }

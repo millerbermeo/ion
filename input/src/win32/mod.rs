@@ -12,4 +12,4 @@ mod inject;
 mod keymap;
 
 pub use capture::WindowsCapture;
-pub use inject::WindowsInjector;
+pub use inject::{WindowsInjector, virtual_screen_geometry};

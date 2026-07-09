@@ -29,6 +29,23 @@ impl WindowsInjector {
     }
 }
 
+/// Origen y tamaño del escritorio virtual completo (todos los monitores) —
+/// lo que usa `normalize_absolute` para mapear coordenadas a la escala
+/// `MOUSEEVENTF_ABSOLUTE`, y lo que reporta este equipo como cliente al
+/// conectarse (ver `core::client`) para que el servidor deje de asumir
+/// que tiene su misma resolución.
+#[must_use]
+pub fn virtual_screen_geometry() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
 /// Convierte una coordenada absoluta de pantalla a la escala 0..=65535 que
 /// `MOUSEEVENTF_ABSOLUTE` espera, relativa al escritorio virtual completo
 /// (multi-monitor incluido).
@@ -101,10 +118,7 @@ impl InputInjector for WindowsInjector {
             // Solo tiene sentido del lado de captura; no hay nada que inyectar.
             CapturedEvent::AbsolutePosition { .. } => Ok(()),
             CapturedEvent::MouseMove { x, y } => {
-                let origin_x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-                let origin_y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-                let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-                let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+                let (origin_x, origin_y, width, height) = virtual_screen_geometry();
                 let dx = normalize_absolute(x, origin_x, width);
                 let dy = normalize_absolute(y, origin_y, height);
                 send_mouse(
