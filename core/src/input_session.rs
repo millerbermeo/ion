@@ -144,10 +144,27 @@ fn handle_position_report(
     let mut state = handoff
         .lock()
         .expect("el lock de handoff no debería estar envenenado");
+
+    // Mientras el control es local, X11 clava el cursor real en el último
+    // píxel válido de la pantalla (nunca reporta `x >= width` ni `x < 0`),
+    // así que `AbsolutePosition` sola nunca dispara un cruce de borde acá
+    // — el usuario queda con el mouse pegado al borde para siempre.
+    // Resincronizar `position` en cada reporte absoluto deja que, apenas
+    // el cursor visual queda pinneado contra el borde, los deltas crudos
+    // de `MouseMove` que siguen llegando (sin ese clamp, ver
+    // `X11Capture`) se acumulen *desde ahí* y sí superen el límite.
+    if state.active() == Active::Local
+        && let CapturedEvent::AbsolutePosition { .. } = event
+    {
+        position.reset(x, y);
+    }
+
     let relevant = matches!(
         (state.active(), event),
-        (Active::Local, CapturedEvent::AbsolutePosition { .. })
-            | (Active::Remote(_), CapturedEvent::MouseMove { .. })
+        (
+            Active::Local,
+            CapturedEvent::AbsolutePosition { .. } | CapturedEvent::MouseMove { .. }
+        ) | (Active::Remote(_), CapturedEvent::MouseMove { .. })
     );
     if !relevant {
         return;
