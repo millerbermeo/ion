@@ -5,7 +5,6 @@ mod commands;
 mod identity;
 mod state;
 
-use tauri::Manager;
 use tauri::tray::TrayIconBuilder;
 
 use state::AppState;
