@@ -12,7 +12,7 @@ workspace = true
 ionconnect-protocol = { version = "0.1.0", path = "../protocol" }
 ionconnect-shared = { version = "0.1.0", path = "../shared" }
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["rt", "macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1.44"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

@@ -65,18 +65,16 @@ impl InputInjector for X11Injector {
             CapturedEvent::Key {
                 keycode, pressed, ..
             } => {
-                // NOTA: `keycode` es el keycode nativo X11 del emisor, sin
-                // normalizar a un espacio común (p. ej. USB HID). Si emisor
-                // y receptor tienen distribuciones o hardware distintos,
-                // esto puede inyectar la tecla equivocada. Pendiente: capa
-                // de normalización de keycodes antes de soporte
-                // multiplataforma real (ver fase `screen`/`core`).
+                // `keycode` viaja como keycode `evdev` (ver
+                // `x11::capture::x11_keycode_to_evdev`) — hay que sumarle
+                // de vuelta el offset de 8 que usa XKB antes de mandarlo a
+                // `xtest_fake_input`, que espera keycodes X11 nativos.
                 let event_type = if pressed {
                     KEY_PRESS_EVENT
                 } else {
                     KEY_RELEASE_EVENT
                 };
-                let code = u8::try_from(keycode).map_err(|_| {
+                let code = u8::try_from(keycode.saturating_add(8)).map_err(|_| {
                     InputError::X11Connection(format!("keycode fuera de rango: {keycode}"))
                 })?;
                 self.conn

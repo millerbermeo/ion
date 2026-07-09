@@ -169,12 +169,12 @@ impl InputCapture for X11Capture {
                     })
                 }
                 Event::XinputRawKeyPress(ev) => Some(CapturedEvent::Key {
-                    keycode: ev.detail,
+                    keycode: x11_keycode_to_evdev(ev.detail),
                     modifiers: KeyModifiers::NONE,
                     pressed: true,
                 }),
                 Event::XinputRawKeyRelease(ev) => Some(CapturedEvent::Key {
-                    keycode: ev.detail,
+                    keycode: x11_keycode_to_evdev(ev.detail),
                     modifiers: KeyModifiers::NONE,
                     pressed: false,
                 }),
@@ -197,6 +197,16 @@ impl InputCapture for X11Capture {
         // orqueste la captura (crate `core`) debe tolerar ese último evento
         // de cola antes de que el hilo termine.
     }
+}
+
+/// El keycode que reporta X11 es el keycode `evdev` del kernel más el
+/// offset fijo de 8 que usa XKB (los primeros 8 códigos están reservados
+/// desde X11 clásico). El wire format del protocolo viaja en `evdev` puro
+/// — mismo espacio que reporta Wayland/`libei` nativamente — así que hay
+/// que restar el offset acá; `x11::inject` lo vuelve a sumar antes de
+/// mandarlo a `xtest_fake_input`.
+const fn x11_keycode_to_evdev(detail: u32) -> u32 {
+    detail.saturating_sub(8)
 }
 
 /// Trunca un delta de valuador XI2 a un rango razonable antes de sumarlo a

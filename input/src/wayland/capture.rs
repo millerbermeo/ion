@@ -22,6 +22,22 @@ fn portal_error(err: impl std::fmt::Display) -> InputError {
     InputError::Portal(err.to_string())
 }
 
+/// Máximo que se espera una respuesta D-Bus del portal antes de darla por
+/// colgada. El portal `InputCapture` (`ext-input-capture-v1` vía Mutter)
+/// puede quedarse sin responder un `Release`/`Enable` ante handoffs muy
+/// seguidos — sin este límite, ese `.await` cuelga para siempre y con él
+/// todo el loop de captura, dejando mouse/teclado agarrados a nivel SO.
+const PORTAL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn with_portal_timeout<T>(
+    label: &'static str,
+    fut: impl std::future::Future<Output = Result<T, InputError>>,
+) -> Result<T, InputError> {
+    tokio::time::timeout(PORTAL_CALL_TIMEOUT, fut)
+        .await
+        .map_err(|_| InputError::Portal(format!("el portal no respondió a tiempo ({label})")))?
+}
+
 /// Códigos de botón Linux Evdev — lo que reporta `libei` en
 /// [`reis::event::Button::button`]. Misma convención que
 /// `wayland::inject::button_to_evdev`, en sentido inverso.
@@ -214,18 +230,20 @@ impl WaylandCaptureSession {
             })
             .collect();
 
-        let response = self
-            .portal
-            .set_pointer_barriers(
-                &self.session,
-                &portal_barriers,
-                zone_set,
-                SetPointerBarriersOptions::default(),
-            )
-            .await
-            .map_err(portal_error)?
-            .response()
-            .map_err(portal_error)?;
+        let response = with_portal_timeout("set_pointer_barriers", async {
+            self.portal
+                .set_pointer_barriers(
+                    &self.session,
+                    &portal_barriers,
+                    zone_set,
+                    SetPointerBarriersOptions::default(),
+                )
+                .await
+                .map_err(portal_error)?
+                .response()
+                .map_err(portal_error)
+        })
+        .await?;
         Ok(response
             .failed_barriers()
             .iter()
@@ -240,10 +258,13 @@ impl WaylandCaptureSession {
     ///
     /// Devuelve [`InputError::Portal`] si la solicitud al portal falla.
     pub async fn enable(&self) -> Result<(), InputError> {
-        self.portal
-            .enable(&self.session, EnableOptions::default())
-            .await
-            .map_err(portal_error)
+        with_portal_timeout("enable", async {
+            self.portal
+                .enable(&self.session, EnableOptions::default())
+                .await
+                .map_err(portal_error)
+        })
+        .await
     }
 
     /// Devuelve el control local, reapareciendo el cursor en `cursor` si se
@@ -257,15 +278,18 @@ impl WaylandCaptureSession {
         activation_id: Option<u32>,
         cursor: Option<(f64, f64)>,
     ) -> Result<(), InputError> {
-        self.portal
-            .release(
-                &self.session,
-                ReleaseOptions::default()
-                    .set_activation_id(activation_id)
-                    .set_cursor_position(cursor),
-            )
-            .await
-            .map_err(portal_error)
+        with_portal_timeout("release", async {
+            self.portal
+                .release(
+                    &self.session,
+                    ReleaseOptions::default()
+                        .set_activation_id(activation_id)
+                        .set_cursor_position(cursor),
+                )
+                .await
+                .map_err(portal_error)
+        })
+        .await
     }
 
     /// Espera el próximo evento relevante: activación/desactivación de la

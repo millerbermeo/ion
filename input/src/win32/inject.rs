@@ -14,6 +14,7 @@ use ionconnect_protocol::MouseButton;
 use crate::error::InputError;
 use crate::event::CapturedEvent;
 use crate::inject::InputInjector;
+use crate::win32::keymap::evdev_to_vk;
 
 /// Inyector de Windows basado en `SendInput`. No mantiene estado propio: a
 /// diferencia de la captura (que necesita un hilo con hook instalado),
@@ -131,12 +132,15 @@ impl InputInjector for WindowsInjector {
             CapturedEvent::Key {
                 keycode, pressed, ..
             } => {
-                // NOTA: mismo hueco de normalización de keycodes que el
-                // backend X11 — ver comentario en `x11::inject`.
-                let vk = u16::try_from(keycode).map_err(|_| {
-                    InputError::Windows(format!("keycode fuera de rango: {keycode}"))
-                })?;
-                send_key(vk, !pressed)
+                // `keycode` viaja como keycode `evdev` (normalizado por el
+                // emisor, sea X11 o Wayland) — hace falta traducirlo al
+                // espacio de `VIRTUAL_KEY` de Windows, no son el mismo
+                // número. Sin mapeo conocido, no inyecta nada en vez de
+                // mandar una tecla equivocada.
+                let Some(vk) = evdev_to_vk(keycode) else {
+                    return Ok(());
+                };
+                send_key(vk.0, !pressed)
             }
         }
     }

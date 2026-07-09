@@ -9,6 +9,7 @@
 
 mod capture;
 mod inject;
+mod keymap;
 
 pub use capture::WindowsCapture;
 pub use inject::WindowsInjector;
