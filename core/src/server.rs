@@ -54,6 +54,11 @@ pub async fn run_server(
     )?);
     let pairing_mode = to_crypto_pairing_mode(settings.pairing_mode);
 
+    info!(
+        width = local_geometry.width,
+        height = local_geometry.height,
+        "geometría local detectada"
+    );
     let mut layout = Layout::new();
     layout.set_desktop(local_device, peer_desktop(local_geometry));
     let mut known_peers: HashMap<DeviceId, String> = HashMap::new();
@@ -65,6 +70,7 @@ pub async fn run_server(
         layout.set_desktop(peer_device, peer_desktop(local_geometry));
         layout.link_mirrored(local_device, peer.edge, peer_device);
         known_peers.insert(peer_device, peer.name.clone());
+        info!(name = %peer.name, edge = ?peer.edge, "borde de hand-off configurado");
     }
 
     let server_config = ionconnect_crypto::server_config(&identity, trust_store, pairing_mode)?;

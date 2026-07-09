@@ -5,7 +5,7 @@ use ionconnect_input::x11::{SharedPosition, X11Capture, X11Control};
 use ionconnect_input::{CapturedEvent, InputCapture as _, InputError};
 use ionconnect_protocol::{KeyboardPress, KeyboardRelease, Message, MouseClick, MouseMove};
 use ionconnect_shared::DeviceId;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::handoff::{Active, HandoffAction, HandoffState};
 use crate::routing::Routing;
@@ -31,6 +31,7 @@ pub fn run_x11_input_session(
     let position = SharedPosition::new(0, 0);
     let mut capture = X11Capture::connect(position.clone())?;
     let control = X11Control::connect()?;
+    info!("captura de entrada X11 iniciada");
 
     let (tx, rx) = std_mpsc::channel();
     let capture_thread = std::thread::spawn(move || {
@@ -113,14 +114,18 @@ fn apply_handoff_action(
 ) {
     match action {
         HandoffAction::ForwardTo { device, x, y } => {
+            info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
             if let Err(err) = control.grab() {
                 warn!(%err, "no se pudo agarrar el puntero para el hand-off");
                 return;
             }
             position.reset(x, y);
-            routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+            if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
+                warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
+            }
         }
         HandoffAction::ReturnLocal { x, y } => {
+            info!(x, y, "hand-off: recuperando control local");
             if let Err(err) = control.ungrab() {
                 warn!(%err, "no se pudo soltar el puntero al devolver el control");
             }
