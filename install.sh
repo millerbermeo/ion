@@ -77,4 +77,18 @@ case ":$PATH:" in
   *) log "Agregá $BIN_DIR a tu PATH (por ejemplo en ~/.bashrc): export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
+if command -v systemctl >/dev/null 2>&1; then
+  log "Instalando servicio systemd de usuario (corre ionconnect-core en segundo plano, sobrevive cerrar la GUI)..."
+  SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  install -m 644 "$INSTALL_DIR/installer/linux/ionconnect-core.service" "$SYSTEMD_USER_DIR/ionconnect-core.service"
+  systemctl --user daemon-reload
+  systemctl --user enable ionconnect-core.service
+  log "Servicio habilitado (arranca solo en el próximo login)."
+  log "Para activarlo ya: systemctl --user start ionconnect-core.service"
+  log "Ojo: si la GUI ya tiene 'ionconnect-core' corriendo (botón Conectar), cerrala antes de arrancar el servicio — los dos compitiendo por el mismo puerto fallan."
+else
+  log "systemctl no encontrado — omitiendo instalación del servicio de background. Instalación manual: ver installer/linux/ionconnect-core.service"
+fi
+
 log "Listo. Buscá 'IonConnect' en el menú de aplicaciones, o corré 'ionconnect-gui'."

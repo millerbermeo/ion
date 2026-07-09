@@ -46,6 +46,18 @@ clonan el repositorio, compilan en modo release y dejan `ionconnect-gui` e
 3. En los demás equipos (**clientes**): cambiar el rol a "Cliente" y poner la dirección `ip:puerto` del servidor.
 4. Correr `ionconnect-core` en los equipos (servidor primero). Mover el mouse hacia el borde configurado pasa el control al equipo vecino.
 
+### Correr en segundo plano (Linux)
+
+`install.sh` deja instalado (pero sin arrancar) un servicio systemd de usuario, así `ionconnect-core` sigue corriendo aunque cierres la GUI:
+
+```bash
+systemctl --user start ionconnect-core.service    # arrancarlo ahora
+systemctl --user status ionconnect-core.service   # ver que esté corriendo
+journalctl --user -u ionconnect-core.service -f   # logs en vivo
+```
+
+Ya quedó habilitado para el próximo login (`enable`). Si usás el servicio, no uses el botón "Conectar" de la GUI en esa máquina — ambos compitiendo por el mismo puerto fallan.
+
 ## Compilar manualmente
 
 Requisitos: [Rust estable](https://rustup.rs/), y en Linux: `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`, `build-essential`.
