@@ -99,6 +99,7 @@ async function pollCoreSnapshot() {
     setConnectionIndicator(snapshot.running ? snapshot.status : "stopped");
     setCoreLog(snapshot.log);
     updateCoreToggleLabel();
+    await loadDevices();
   } catch {
     // get_core_snapshot no debería fallar nunca; si pasa, seguimos
     // sondeando en el próximo tick en vez de romper el polling.

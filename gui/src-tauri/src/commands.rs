@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// en una sesión larga.
 const CORE_LOG_CAPACITY: usize = 500;
 
-use crate::state::AppState;
+use crate::state::{AppState, ConnectedPeer};
 
 /// El `device_id` derivado de la identidad TLS de este equipo, en el mismo
 /// formato hexadecimal que espera `PeerConfig::device_id` — para que el
@@ -50,13 +50,22 @@ pub struct DeviceSummary {
     pub latency_ms: Option<u32>,
 }
 
-/// Sin el IPC hacia `core` (fase 9) todavía no hay un servicio real del que
-/// listar equipos conectados. Devuelve una lista vacía por ahora; la GUI ya
-/// puede construirse contra esta forma y solo cambiar la fuente de datos
-/// cuando el IPC exista.
+/// Equipos que `core` reportó como conectados, extraídos en vivo de su log
+/// (ver [`stream_output`]). Del lado servidor son los peers autenticados;
+/// del lado cliente es el propio servidor una vez conectado.
 #[tauri::command]
-pub fn list_devices() -> Vec<DeviceSummary> {
-    Vec::new()
+pub fn list_devices(state: State<AppState>) -> Vec<DeviceSummary> {
+    state
+        .core_peers
+        .lock()
+        .expect("el lock de peers no debería estar envenenado")
+        .iter()
+        .map(|p| DeviceSummary {
+            name: p.name.clone(),
+            connected: true,
+            latency_ms: None,
+        })
+        .collect()
 }
 
 /// Ruta al binario `ionconnect-core`. Se asume instalado junto a la GUI
@@ -99,15 +108,50 @@ fn classify_line(line: &str) -> Option<&'static str> {
     }
 }
 
-/// Lee `reader` línea a línea en un hilo dedicado y la vuelca en
-/// `AppState::core_log`/`core_status` (fuente de verdad, leída por
-/// polling desde la GUI) y además la emite como evento (`core-log`,
-/// `core-status`) por si el frontend quiere reaccionar al instante.
+/// Saca los códigos de color ANSI (`\x1b[...m`) que `tracing_subscriber`
+/// mete en cada línea cuando cree que escribe a una terminal. Necesario
+/// tanto para que el panel de log se lea bien como para poder parsear
+/// campos `clave=valor` de forma confiable (los códigos quedan pegados
+/// entre la clave y el `=`, así que un `contains("device_id=")` ingenuo
+/// no matchea si no se limpia antes).
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Extrae el valor de un campo `clave=valor` separado por espacios (el
+/// formato que usa `tracing_subscriber` para campos estructurados).
+fn extract_field(line: &str, prefix: &str) -> Option<String> {
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(prefix))
+        .map(str::to_string)
+}
+
+/// Lee `reader` línea a línea en un hilo dedicado, la limpia de ANSI, y
+/// la vuelca en `AppState::core_log`/`core_status`/`core_peers` (fuente
+/// de verdad, leída por *polling* desde la GUI) y además la emite como
+/// evento (`core-log`, `core-status`) por si el frontend quiere
+/// reaccionar al instante.
 fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
     std::thread::spawn(move || {
         let buf = BufReader::new(reader);
-        for line in buf.lines().map_while(Result::ok) {
+        for raw_line in buf.lines().map_while(Result::ok) {
+            let line = strip_ansi(&raw_line);
             let state = app.state::<AppState>();
+
             if let Ok(mut log) = state.core_log.lock() {
                 log.push(line.clone());
                 let overflow = log.len().saturating_sub(CORE_LOG_CAPACITY);
@@ -115,12 +159,41 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
                     log.drain(0..overflow);
                 }
             }
+
             if let Some(status) = classify_line(&line) {
                 if let Ok(mut current) = state.core_status.lock() {
                     *current = status.to_string();
                 }
                 let _ = app.emit("core-status", status);
             }
+
+            if let Ok(mut peers) = state.core_peers.lock() {
+                if line.contains("peer autenticado") {
+                    if let (Some(device_id), Some(name)) = (
+                        extract_field(&line, "device_id="),
+                        extract_field(&line, "name="),
+                    ) {
+                        if !peers.iter().any(|p| p.device_id == device_id) {
+                            peers.push(ConnectedPeer { device_id, name });
+                        }
+                    }
+                } else if line.contains("peer desconectado") {
+                    if let Some(device_id) = extract_field(&line, "device_id=") {
+                        peers.retain(|p| p.device_id != device_id);
+                    }
+                } else if line.contains("conectado al servidor") {
+                    if let Some(name) = extract_field(&line, "server=") {
+                        peers.retain(|p| p.device_id != "server");
+                        peers.push(ConnectedPeer {
+                            device_id: "server".to_string(),
+                            name,
+                        });
+                    }
+                } else if line.contains("reintentando conexión") {
+                    peers.retain(|p| p.device_id != "server");
+                }
+            }
+
             let _ = app.emit("core-log", &line);
         }
     });
@@ -160,6 +233,11 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
         .lock()
         .expect("el lock del log no debería estar envenenado")
         .clear();
+    state
+        .core_peers
+        .lock()
+        .expect("el lock de peers no debería estar envenenado")
+        .clear();
     *state
         .core_status
         .lock()
@@ -185,6 +263,11 @@ pub fn stop_core(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 .core_status
                 .lock()
                 .expect("el lock de estado no debería estar envenenado") = "stopped".to_string();
+            state
+                .core_peers
+                .lock()
+                .expect("el lock de peers no debería estar envenenado")
+                .clear();
             let _ = app.emit("core-status", "stopped");
             Ok(())
         }

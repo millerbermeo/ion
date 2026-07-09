@@ -22,6 +22,16 @@ pub struct AppState {
     pub core_child: Mutex<Option<Child>>,
     pub core_log: Mutex<Vec<String>>,
     pub core_status: Mutex<String>,
+    pub core_peers: Mutex<Vec<ConnectedPeer>>,
+}
+
+/// Un equipo que `core` reportó como conectado, extraído en vivo de sus
+/// líneas de log (`peer autenticado` del lado servidor, `conectado al
+/// servidor` del lado cliente — ver `commands::stream_output`).
+#[derive(Debug, Clone)]
+pub struct ConnectedPeer {
+    pub device_id: String,
+    pub name: String,
 }
 
 impl AppState {
@@ -41,6 +51,7 @@ impl AppState {
             core_child: Mutex::new(None),
             core_log: Mutex::new(Vec::new()),
             core_status: Mutex::new("stopped".to_string()),
+            core_peers: Mutex::new(Vec::new()),
         }
     }
 }
