@@ -1,5 +1,8 @@
 use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, GrabStatus, Window};
+use x11rb::protocol::xproto::{
+    ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, GrabMode, GrabStatus, Window,
+    WindowClass,
+};
 use x11rb::rust_connection::RustConnection;
 
 use crate::error::InputError;
@@ -21,6 +24,24 @@ fn x11_error(err: impl std::fmt::Display) -> InputError {
 pub struct X11Control {
     conn: RustConnection,
     root: Window,
+    /// Ventana `InputOnly` de 1x1 invisible, reposicionada sobre el punto
+    /// de entrada y usada como `confine_to` en cada [`Self::grab`] — sin
+    /// ella, `grab_pointer` con modo `ASYNC` y `confine_to = None` no
+    /// confina nada: el ícono real sigue el mouse físico libremente por
+    /// toda la pantalla mientras el control ya pasó al remoto, dando la
+    /// sensación de que el movimiento se "duplica" en ambos equipos.
+    /// Confinar el cursor a esta ventana lo deja clavado en el punto de
+    /// hand-off mientras dure el grab, sin afectar los deltas crudos de
+    /// `XI_RawMotion` (que reflejan el hardware, no la posición on-screen).
+    confine_window: Window,
+    /// Tamaño real de la pantalla raíz — para acotar a [`Self::grab`] la
+    /// posición donde se planta `confine_window`. El `(x, y)` que dispara
+    /// un hand-off puede caer justo un poco más allá del borde físico
+    /// (es lo que hace que se detecte el cruce, ver `HandoffState`), así
+    /// que sin este clamp la ventana de confinamiento terminaría fuera de
+    /// la pantalla real.
+    width: u16,
+    height: u16,
 }
 
 impl X11Control {
@@ -30,8 +51,36 @@ impl X11Control {
     /// disponible.
     pub fn connect() -> Result<Self, InputError> {
         let (conn, screen_num) = x11rb::connect(None).map_err(x11_error)?;
-        let root = conn.setup().roots[screen_num].root;
-        Ok(Self { conn, root })
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let width = screen.width_in_pixels;
+        let height = screen.height_in_pixels;
+
+        let confine_window = conn.generate_id().map_err(x11_error)?;
+        conn.create_window(
+            0,
+            confine_window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &CreateWindowAux::new().override_redirect(1),
+        )
+        .map_err(x11_error)?
+        .check()
+        .map_err(x11_error)?;
+
+        Ok(Self {
+            conn,
+            root,
+            confine_window,
+            width,
+            height,
+        })
     }
 
     /// Ancho/alto en píxeles de la pantalla raíz — en un `Xorg` con varios
@@ -59,16 +108,31 @@ impl X11Control {
     /// entrada normales — es lo que hay que llamar justo al detectar un
     /// hand-off hacia un equipo remoto.
     ///
-    /// No oculta el cursor visualmente (dejar el ícono real quieto en el
-    /// borde es un defecto cosmético conocido, no funcional). `confine_to`/
-    /// `cursor` en `0` (`XCB_NONE`) significan "sin restricción de ventana"
-    /// / "no cambiar el ícono del cursor".
+    /// Confina el cursor real a `(x, y)` (el punto de hand-off) vía una
+    /// ventana `InputOnly` de 1x1 invisible — sin esto el ícono sigue el
+    /// mouse físico libremente por toda la pantalla local aunque el
+    /// control ya haya pasado al remoto, dando la sensación de que el
+    /// movimiento se duplica en ambos equipos. `cursor` en `0` (`XCB_NONE`)
+    /// significa "no cambiar el ícono del cursor".
     ///
     /// # Errors
     ///
     /// Devuelve [`InputError::X11Connection`] si el servidor rechaza el
     /// grab (por ejemplo, si otro cliente ya lo tiene).
-    pub fn grab(&self) -> Result<(), InputError> {
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn grab(&self, x: i32, y: i32) -> Result<(), InputError> {
+        let x = x.clamp(0, i32::from(self.width) - 1);
+        let y = y.clamp(0, i32::from(self.height) - 1);
+        self.conn
+            .configure_window(
+                self.confine_window,
+                &ConfigureWindowAux::new().x(x).y(y),
+            )
+            .map_err(x11_error)?;
+        self.conn
+            .map_window(self.confine_window)
+            .map_err(x11_error)?;
+
         let reply = self
             .conn
             .grab_pointer(
@@ -77,7 +141,7 @@ impl X11Control {
                 x11rb::protocol::xproto::EventMask::NO_EVENT,
                 GrabMode::ASYNC,
                 GrabMode::ASYNC,
-                0u32,
+                self.confine_window,
                 0u32,
                 0u32,
             )
@@ -85,6 +149,8 @@ impl X11Control {
             .reply()
             .map_err(x11_error)?;
         if reply.status != GrabStatus::SUCCESS {
+            let _ = self.conn.unmap_window(self.confine_window);
+            self.conn.flush().map_err(x11_error)?;
             return Err(InputError::X11Connection(format!(
                 "grab_pointer falló con status {:?}",
                 reply.status
@@ -100,7 +166,8 @@ impl X11Control {
     }
 
     /// Libera el agarre exclusivo de puntero y teclado, devolviendo el
-    /// control normal al resto del sistema.
+    /// control normal al resto del sistema — y desmapea la ventana de
+    /// confinamiento usada por [`Self::grab`].
     ///
     /// # Errors
     ///
@@ -108,6 +175,9 @@ impl X11Control {
     pub fn ungrab(&self) -> Result<(), InputError> {
         self.conn.ungrab_pointer(0u32).map_err(x11_error)?;
         self.conn.ungrab_keyboard(0u32).map_err(x11_error)?;
+        self.conn
+            .unmap_window(self.confine_window)
+            .map_err(x11_error)?;
         self.conn.flush().map_err(x11_error)?;
         Ok(())
     }

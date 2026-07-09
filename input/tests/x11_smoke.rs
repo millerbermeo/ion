@@ -88,7 +88,7 @@ fn grab_ungrab_and_warp_do_not_error() {
     let control = X11Control::connect().expect("la conexión de control no debería fallar");
 
     control
-        .grab()
+        .grab(50, 60)
         .expect("agarrar puntero+teclado no debería fallar");
     control
         .warp_to(50, 60)

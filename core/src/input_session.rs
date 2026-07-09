@@ -92,7 +92,13 @@ fn reclaim_if_peer_gone(
         .reclaim_if_remote(device);
     if reclaimed {
         let (x, y) = position.get();
-        apply_handoff_action(HandoffAction::ReturnLocal { x, y }, control, position, routing);
+        apply_handoff_action(
+            HandoffAction::ReturnLocal { x, y },
+            control,
+            position,
+            routing,
+            (x, y),
+        );
     }
 }
 
@@ -172,7 +178,7 @@ fn handle_position_report(
 
     if let Some(action) = state.on_position(x, y) {
         drop(state);
-        apply_handoff_action(action, control, position, routing);
+        apply_handoff_action(action, control, position, routing, (x, y));
     } else if let Active::Remote(device) = state.active() {
         // Sin vecino enlazado en el borde que se acaba de cruzar (o
         // todavía dentro de límites): igual hay que pegar la posición al
@@ -185,16 +191,22 @@ fn handle_position_report(
     }
 }
 
+/// `local_xy` es la posición real en la pantalla *local* en el instante del
+/// hand-off (no confundir con `x, y` dentro de `HandoffAction::ForwardTo`,
+/// que ya están expresados en el escritorio del equipo remoto) — se usa
+/// para clavar ahí el cursor real vía [`X11Control::grab`] y que no se
+/// pasee por toda la pantalla local mientras el control ya es del remoto.
 fn apply_handoff_action(
     action: HandoffAction,
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
+    local_xy: (i32, i32),
 ) {
     match action {
         HandoffAction::ForwardTo { device, x, y } => {
             info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
-            if let Err(err) = control.grab() {
+            if let Err(err) = control.grab(local_xy.0, local_xy.1) {
                 warn!(%err, "no se pudo agarrar el puntero para el hand-off");
                 return;
             }
