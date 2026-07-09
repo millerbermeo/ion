@@ -142,6 +142,7 @@ fn reclaim_if_peer_gone(
         let (x, y) = position.get();
         apply_handoff_action(
             HandoffAction::ReturnLocal { x, y },
+            handoff,
             control,
             position,
             routing,
@@ -230,7 +231,7 @@ fn handle_position_report(
 
     if let Some(action) = state.on_position(x, y) {
         drop(state);
-        apply_handoff_action(action, control, position, routing, (x, y));
+        apply_handoff_action(action, handoff, control, position, routing, (x, y));
     } else if let Active::Remote(device) = state.active() {
         // Sin vecino enlazado en el borde que se acaba de cruzar (o
         // todavía dentro de límites): igual hay que pegar la posición al
@@ -250,6 +251,7 @@ fn handle_position_report(
 /// pasee por toda la pantalla local mientras el control ya es del remoto.
 fn apply_handoff_action(
     action: HandoffAction,
+    handoff: &Arc<Mutex<HandoffState>>,
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
@@ -259,7 +261,22 @@ fn apply_handoff_action(
         HandoffAction::ForwardTo { device, x, y } => {
             info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
             if let Err(err) = control.grab(local_xy.0, local_xy.1) {
-                warn!(%err, "no se pudo agarrar el puntero para el hand-off");
+                // `HandoffState::on_position` ya marcó el estado como
+                // `Remote` antes de esto (necesita decidir el hand-off
+                // antes de saber si el grab real va a funcionar). Si el
+                // grab falla — típicamente porque otro cliente X11 (p. ej.
+                // GNOME Shell con su vista de actividades abierta) ya tiene
+                // el puntero agarrado — el cursor real queda sin confinar
+                // pero el estado interno sigue pensando que el control es
+                // remoto, y arranca a reenviar movimiento igual: se ve
+                // como si el mouse se moviera en las dos pantallas a la
+                // vez. Sin este `reclaim_if_remote`, ese estado fantasma
+                // queda pegado hasta el próximo cruce de borde real.
+                warn!(%err, "no se pudo agarrar el puntero para el hand-off, revirtiendo a control local");
+                handoff
+                    .lock()
+                    .expect("el lock de handoff no debería estar envenenado")
+                    .reclaim_if_remote(device);
                 return;
             }
             position.reset(x, y);
