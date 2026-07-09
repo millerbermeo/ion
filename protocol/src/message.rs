@@ -72,6 +72,13 @@ pub enum MouseButton {
     Middle = 2,
     Back = 3,
     Forward = 4,
+    /// Una "muesca" (notch) de scroll, no un botón mantenido — igual que
+    /// X11 (botones 4-7) y la mayoría de las APIs nativas la modelan como
+    /// press+release instantáneo, no como un botón que se sostiene.
+    ScrollUp = 5,
+    ScrollDown = 6,
+    ScrollLeft = 7,
+    ScrollRight = 8,
 }
 
 impl TryFrom<u8> for MouseButton {
@@ -84,6 +91,10 @@ impl TryFrom<u8> for MouseButton {
             2 => Ok(Self::Middle),
             3 => Ok(Self::Back),
             4 => Ok(Self::Forward),
+            5 => Ok(Self::ScrollUp),
+            6 => Ok(Self::ScrollDown),
+            7 => Ok(Self::ScrollLeft),
+            8 => Ok(Self::ScrollRight),
             other => Err(ProtocolError::InvalidEnumValue(other)),
         }
     }

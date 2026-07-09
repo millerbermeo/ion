@@ -1,12 +1,13 @@
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    XBUTTON1, XBUTTON2,
+    WHEEL_DELTA, XBUTTON1, XBUTTON2,
 };
 
 use ionconnect_protocol::MouseButton;
@@ -128,6 +129,37 @@ impl InputInjector for WindowsInjector {
                     MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 )
             }
+            // El scroll wheel de Windows no tiene down/up: `SendInput` con
+            // `MOUSEEVENTF_WHEEL`/`_HWHEEL` es un único evento atómico por
+            // muesca. El emisor (ver `x11::util::button_to_code`) reporta
+            // cada muesca como un par press+release — acá solo se actúa en
+            // el `pressed: true` y se ignora el `false` que le sigue.
+            CapturedEvent::MouseButton {
+                button:
+                    button @ (MouseButton::ScrollUp
+                    | MouseButton::ScrollDown
+                    | MouseButton::ScrollLeft
+                    | MouseButton::ScrollRight),
+                pressed,
+            } => {
+                if !pressed {
+                    return Ok(());
+                }
+                #[allow(clippy::cast_possible_wrap)]
+                let delta = WHEEL_DELTA as i32;
+                let (flags, mouse_data) = match button {
+                    MouseButton::ScrollUp => (MOUSEEVENTF_WHEEL, delta),
+                    MouseButton::ScrollDown => (MOUSEEVENTF_WHEEL, -delta),
+                    MouseButton::ScrollRight => (MOUSEEVENTF_HWHEEL, delta),
+                    MouseButton::ScrollLeft => (MOUSEEVENTF_HWHEEL, -delta),
+                    MouseButton::Left
+                    | MouseButton::Right
+                    | MouseButton::Middle
+                    | MouseButton::Back
+                    | MouseButton::Forward => unreachable!("filtrado por el patrón del match"),
+                };
+                send_mouse(0, 0, mouse_data, flags)
+            }
             CapturedEvent::MouseButton { button, pressed } => {
                 let (flags, mouse_data) = match button {
                     MouseButton::Left if pressed => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -140,6 +172,12 @@ impl InputInjector for WindowsInjector {
                     MouseButton::Back => (MOUSEEVENTF_XUP, i32::from(XBUTTON1)),
                     MouseButton::Forward if pressed => (MOUSEEVENTF_XDOWN, i32::from(XBUTTON2)),
                     MouseButton::Forward => (MOUSEEVENTF_XUP, i32::from(XBUTTON2)),
+                    MouseButton::ScrollUp
+                    | MouseButton::ScrollDown
+                    | MouseButton::ScrollLeft
+                    | MouseButton::ScrollRight => {
+                        unreachable!("filtrado por el brazo anterior del match")
+                    }
                 };
                 send_mouse(0, 0, mouse_data, flags)
             }

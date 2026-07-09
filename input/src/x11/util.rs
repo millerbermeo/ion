@@ -2,12 +2,19 @@ use ionconnect_protocol::MouseButton;
 use x11rb::protocol::xinput::Fp3232;
 
 /// X11 core protocol no tiene botones "back"/"forward" estándar; se mapean
-/// a los códigos 8/9 que la inmensa mayoría de mice y drivers usan.
+/// a los códigos 8/9 que la inmensa mayoría de mice y drivers usan. El
+/// scroll wheel tampoco es un eje separado en el protocolo core/XTEST: cada
+/// muesca es un click+release del botón 4 (arriba), 5 (abajo), 6
+/// (izquierda) o 7 (derecha) — convención estándar de X11 desde XFree86.
 pub(super) const fn button_to_code(button: MouseButton) -> u8 {
     match button {
         MouseButton::Left => 1,
         MouseButton::Middle => 2,
         MouseButton::Right => 3,
+        MouseButton::ScrollUp => 4,
+        MouseButton::ScrollDown => 5,
+        MouseButton::ScrollLeft => 6,
+        MouseButton::ScrollRight => 7,
         MouseButton::Back => 8,
         MouseButton::Forward => 9,
     }
@@ -18,6 +25,10 @@ pub(super) const fn button_from_code(code: u32) -> Option<MouseButton> {
         1 => Some(MouseButton::Left),
         2 => Some(MouseButton::Middle),
         3 => Some(MouseButton::Right),
+        4 => Some(MouseButton::ScrollUp),
+        5 => Some(MouseButton::ScrollDown),
+        6 => Some(MouseButton::ScrollLeft),
+        7 => Some(MouseButton::ScrollRight),
         8 => Some(MouseButton::Back),
         9 => Some(MouseButton::Forward),
         _ => None,
@@ -60,6 +71,10 @@ mod tests {
             MouseButton::Right,
             MouseButton::Back,
             MouseButton::Forward,
+            MouseButton::ScrollUp,
+            MouseButton::ScrollDown,
+            MouseButton::ScrollLeft,
+            MouseButton::ScrollRight,
         ] {
             assert_eq!(
                 button_from_code(u32::from(button_to_code(button))),

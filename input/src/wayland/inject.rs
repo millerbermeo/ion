@@ -1,6 +1,7 @@
 use ashpd::desktop::remote_desktop::{
-    DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyPointerButtonOptions,
-    NotifyPointerMotionOptions, RemoteDesktop, SelectDevicesOptions, StartOptions,
+    Axis, DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyPointerAxisDiscreteOptions,
+    NotifyPointerButtonOptions, NotifyPointerMotionOptions, RemoteDesktop, SelectDevicesOptions,
+    StartOptions,
 };
 use ashpd::desktop::{CreateSessionOptions, Session};
 use ashpd::enumflags2::BitFlags;
@@ -23,13 +24,33 @@ const BTN_MIDDLE: i32 = 0x112;
 const BTN_SIDE: i32 = 0x113;
 const BTN_EXTRA: i32 = 0x114;
 
-const fn button_to_evdev(button: MouseButton) -> i32 {
+/// `None` para las variantes de scroll: el portal no las modela como botón
+/// sino como eje discreto (ver [`scroll_axis`]) — se manejan aparte en
+/// [`WaylandPortalInjector::inject_async`].
+const fn button_to_evdev(button: MouseButton) -> Option<i32> {
     match button {
-        MouseButton::Left => BTN_LEFT,
-        MouseButton::Right => BTN_RIGHT,
-        MouseButton::Middle => BTN_MIDDLE,
-        MouseButton::Back => BTN_SIDE,
-        MouseButton::Forward => BTN_EXTRA,
+        MouseButton::Left => Some(BTN_LEFT),
+        MouseButton::Right => Some(BTN_RIGHT),
+        MouseButton::Middle => Some(BTN_MIDDLE),
+        MouseButton::Back => Some(BTN_SIDE),
+        MouseButton::Forward => Some(BTN_EXTRA),
+        MouseButton::ScrollUp
+        | MouseButton::ScrollDown
+        | MouseButton::ScrollLeft
+        | MouseButton::ScrollRight => None,
+    }
+}
+
+/// Eje y cantidad de pasos para una muesca de scroll — convención estándar
+/// wayland/libinput: vertical positivo = hacia abajo, horizontal positivo =
+/// hacia la derecha.
+const fn scroll_axis(button: MouseButton) -> Option<(Axis, i32)> {
+    match button {
+        MouseButton::ScrollUp => Some((Axis::Vertical, -1)),
+        MouseButton::ScrollDown => Some((Axis::Vertical, 1)),
+        MouseButton::ScrollLeft => Some((Axis::Horizontal, -1)),
+        MouseButton::ScrollRight => Some((Axis::Horizontal, 1)),
+        _ => None,
     }
 }
 
@@ -106,16 +127,40 @@ impl WaylandPortalInjector {
                     .await
                     .map_err(portal_error)
             }
+            // El scroll no es un botón que se sostiene sino una muesca
+            // discreta — el emisor la reporta como un par press+release
+            // instantáneo (ver `x11::util::button_to_code`), así que basta
+            // con actuar en el `pressed: true` e ignorar el `false` que le
+            // sigue, igual que hace `win32::inject`.
+            CapturedEvent::MouseButton { button, pressed } if scroll_axis(button).is_some() => {
+                let (axis, steps) =
+                    scroll_axis(button).expect("scroll_axis(button).is_some() ya comprobado");
+                if !pressed {
+                    return Ok(());
+                }
+                self.portal
+                    .notify_pointer_axis_discrete(
+                        &self.session,
+                        axis,
+                        steps,
+                        NotifyPointerAxisDiscreteOptions::default(),
+                    )
+                    .await
+                    .map_err(portal_error)
+            }
             CapturedEvent::MouseButton { button, pressed } => {
                 let state = if pressed {
                     KeyState::Pressed
                 } else {
                     KeyState::Released
                 };
+                let Some(evdev) = button_to_evdev(button) else {
+                    return Ok(());
+                };
                 self.portal
                     .notify_pointer_button(
                         &self.session,
-                        button_to_evdev(button),
+                        evdev,
                         state,
                         NotifyPointerButtonOptions::default(),
                     )
