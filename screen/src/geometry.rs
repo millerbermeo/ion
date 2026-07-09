@@ -49,6 +49,19 @@ impl MonitorGeometry {
         x >= self.left() && x < self.right() && y >= self.top() && y < self.bottom()
     }
 
+    /// Ajusta `(x, y)` para que caiga dentro de este rectángulo — pega el
+    /// punto a la pared más cercana en vez de dejarlo salir. Para cuando no
+    /// hay ningún borde vecino enlazado en esa dirección: sin este freno,
+    /// una posición acumulada a partir de deltas (mientras el control está
+    /// en remoto) puede alejarse sin límite del escritorio real y mandar
+    /// coordenadas sin sentido a inyectar del otro lado.
+    #[must_use]
+    pub fn clamp_point(&self, x: i32, y: i32) -> (i32, i32) {
+        let x = x.clamp(self.left(), self.right() - 1);
+        let y = y.clamp(self.top(), self.bottom() - 1);
+        (x, y)
+    }
+
     /// Rectángulo más pequeño que contiene a `self` y `other`.
     ///
     /// `right >= left` y `bottom >= top` siempre se cumplen aquí (son un
@@ -106,6 +119,16 @@ impl VirtualDesktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_point_pins_out_of_bounds_coordinates_to_the_nearest_edge() {
+        let monitor = MonitorGeometry::new(0, 0, 1920, 1080);
+        assert_eq!(monitor.clamp_point(960, 540), (960, 540));
+        assert_eq!(monitor.clamp_point(-500, 540), (0, 540));
+        assert_eq!(monitor.clamp_point(5000, 540), (1919, 540));
+        assert_eq!(monitor.clamp_point(960, -500), (960, 0));
+        assert_eq!(monitor.clamp_point(960, 5000), (960, 1079));
+    }
 
     #[test]
     fn single_monitor_contains_its_own_area_only() {

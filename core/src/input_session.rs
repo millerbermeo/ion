@@ -157,7 +157,13 @@ fn handle_position_report(
         drop(state);
         apply_handoff_action(action, control, position, routing);
     } else if let Active::Remote(device) = state.active() {
+        // Sin vecino enlazado en el borde que se acaba de cruzar (o
+        // todavía dentro de límites): igual hay que pegar la posición al
+        // escritorio del remoto, si no la acumulada sigue alejándose sin
+        // límite — ver la documentación de `clamp_to_active_desktop`.
+        let (x, y) = state.clamp_to_active_desktop(x, y);
         drop(state);
+        position.reset(x, y);
         routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
     }
 }
@@ -408,17 +414,25 @@ async fn handle_wayland_input(
             {
                 info!(x, y, "posición de mouse capturada (Wayland)");
             }
-            let action = handoff
+            let mut guard = handoff
                 .lock()
-                .expect("el lock de handoff no debería estar envenenado")
-                .on_position(x, y);
+                .expect("el lock de handoff no debería estar envenenado");
+            let action = guard.on_position(x, y);
             if let Some(HandoffAction::ReturnLocal { x, y }) = action {
+                drop(guard);
                 info!(x, y, "hand-off: recuperando control local");
                 let _ = session
                     .release(*current_activation, Some((f64::from(x), f64::from(y))))
                     .await;
                 *current_activation = None;
             } else {
+                // Sin vecino enlazado en ese borde (o todavía dentro de
+                // límites): pegar la posición al escritorio del remoto
+                // para que la acumulada no se aleje sin límite — ver
+                // `HandoffState::clamp_to_active_desktop`.
+                let (x, y) = guard.clamp_to_active_desktop(x, y);
+                drop(guard);
+                session.reset_position(x, y);
                 routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
             }
         }

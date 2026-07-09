@@ -93,6 +93,28 @@ impl HandoffState {
             false
         }
     }
+
+    /// Ajusta `(x, y)` para que caiga dentro del escritorio virtual del
+    /// dispositivo activo — usar en cada posición que se vaya a reenviar
+    /// mientras `active() == Remote(_)`. Sin esto, un borde sin vecino
+    /// enlazado (p. ej. arriba/abajo en un layout que solo conecta
+    /// izquierda/derecha) deja que la posición acumulada a partir de
+    /// deltas del mouse físico se aleje sin límite del escritorio real del
+    /// peer — coordenadas como `y = 5000` en una pantalla de 1440px, que
+    /// del otro lado se traducen en clics/movimientos sin sentido. Si no
+    /// hay geometría conocida para el dispositivo activo, devuelve
+    /// `(x, y)` sin tocar.
+    #[must_use]
+    pub fn clamp_to_active_desktop(&self, x: i32, y: i32) -> (i32, i32) {
+        let device = match self.active {
+            Active::Local => self.local_device,
+            Active::Remote(device) => device,
+        };
+        self.layout
+            .desktop(device)
+            .and_then(ionconnect_screen::VirtualDesktop::bounds)
+            .map_or((x, y), |bounds| bounds.clamp_point(x, y))
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +180,26 @@ mod tests {
             .expect("debería devolver el control");
         assert_eq!(action, HandoffAction::ReturnLocal { x: 1919, y: 300 });
         assert_eq!(state.active(), Active::Local);
+    }
+
+    #[test]
+    fn clamp_to_active_desktop_pins_runaway_coordinates_on_the_linked_axis_only() {
+        let local = DeviceId::new();
+        let remote = DeviceId::new();
+        // Solo se enlaza el borde derecho/izquierdo (típico "uno al lado
+        // del otro") — arriba/abajo se queda sin vecino, que es
+        // justamente el caso que se escapaba sin el clamp.
+        let mut state = HandoffState::new(layout_with_one_neighbor(local, remote), local);
+        state.on_position(1920, 540);
+        assert_eq!(state.active(), Active::Remote(remote));
+
+        // Un delta enorme hacia abajo, muy por fuera de los 1080px de la
+        // pantalla del remoto asumida — sin vecino en ese borde, antes se
+        // dejaba crecer sin límite.
+        assert_eq!(state.clamp_to_active_desktop(500, 5000), (500, 1079));
+        assert_eq!(state.clamp_to_active_desktop(500, -5000), (500, 0));
+        // Dentro de límites: no toca nada.
+        assert_eq!(state.clamp_to_active_desktop(500, 300), (500, 300));
     }
 
     #[test]
