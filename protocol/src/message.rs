@@ -22,6 +22,7 @@ pub enum MessageType {
     Reconnect = 8,
     Version = 9,
     DisplayGeometry = 10,
+    UdpHello = 11,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -40,6 +41,7 @@ impl TryFrom<u8> for MessageType {
             8 => Ok(Self::Reconnect),
             9 => Ok(Self::Version),
             10 => Ok(Self::DisplayGeometry),
+            11 => Ok(Self::UdpHello),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -180,6 +182,16 @@ pub struct DisplayGeometry {
     pub height: u32,
 }
 
+/// El cliente lo manda por el canal TCP ya confiable, una vez por sesión
+/// (justo después de `DisplayGeometry`), para avisarle al servidor a qué
+/// puerto UDP local mandarle los `MouseMove` continuos — el servidor ya
+/// conoce la IP del cliente por la conexión TCP, le falta el puerto porque
+/// el cliente bindea el socket UDP en uno efímero. Ver `core::udp_peers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpHello {
+    pub port: u16,
+}
+
 /// Envoltura de todos los tipos de mensaje del protocolo `IonConnect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -194,6 +206,7 @@ pub enum Message {
     Reconnect(Reconnect),
     Version(Version),
     DisplayGeometry(DisplayGeometry),
+    UdpHello(UdpHello),
 }
 
 impl Message {
@@ -211,6 +224,7 @@ impl Message {
             Self::Reconnect(_) => MessageType::Reconnect,
             Self::Version(_) => MessageType::Version,
             Self::DisplayGeometry(_) => MessageType::DisplayGeometry,
+            Self::UdpHello(_) => MessageType::UdpHello,
         }
     }
 }

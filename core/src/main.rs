@@ -9,6 +9,7 @@ mod peer_id;
 mod routing;
 mod server;
 mod trust_store;
+mod udp_peers;
 
 use std::path::PathBuf;
 

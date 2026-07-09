@@ -1978,6 +1978,7 @@ dependencies = [
  "ionconnect-shared",
  "mdns-sd",
  "rand",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "thiserror 2.0.18",

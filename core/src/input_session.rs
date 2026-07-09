@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::handoff::{Active, HandoffAction, HandoffState};
 use crate::routing::Routing;
+use crate::udp_peers::UdpPeers;
 
 /// Filtra pulsaciones/clics duplicados que a veces reporta la captura del
 /// sistema operativo para una sola acción física real (ver
@@ -77,6 +78,7 @@ impl HeldGuard {
 pub fn run_x11_input_session(
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Arc<Routing>,
+    udp_peers: &Arc<UdpPeers>,
 ) -> Result<(), InputError> {
     let position = SharedPosition::new(0, 0);
     let mut capture = X11Capture::connect(position.clone())?;
@@ -92,7 +94,9 @@ pub fn run_x11_input_session(
 
     let mut held = HeldGuard::default();
     while let Ok(event) = rx.recv() {
-        handle_captured_event(event, handoff, &control, &position, routing, &mut held);
+        handle_captured_event(
+            event, handoff, &control, &position, routing, udp_peers, &mut held,
+        );
     }
 
     let _ = capture_thread.join();
@@ -151,12 +155,14 @@ fn reclaim_if_peer_gone(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_captured_event(
     event: CapturedEvent,
     handoff: &Arc<Mutex<HandoffState>>,
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
+    udp_peers: &UdpPeers,
     held: &mut HeldGuard,
 ) {
     reclaim_if_peer_gone(handoff, control, position, routing);
@@ -166,7 +172,7 @@ fn handle_captured_event(
             {
                 info!(x, y, ?event, "posición de mouse capturada");
             }
-            handle_position_report(event, x, y, handoff, control, position, routing);
+            handle_position_report(event, x, y, handoff, control, position, routing, udp_peers);
         }
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. } => {
             if !held.accept(&event) {
@@ -191,6 +197,7 @@ fn handle_captured_event(
 /// sigue moviendo el cursor real, y es lo único fiable ahí; posición
 /// acumulada (cruda) mientras `Remote` — ver la documentación de
 /// [`ionconnect_input::x11::X11Capture`] para el porqué.
+#[allow(clippy::too_many_arguments)]
 fn handle_position_report(
     event: CapturedEvent,
     x: i32,
@@ -199,6 +206,7 @@ fn handle_position_report(
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
+    udp_peers: &UdpPeers,
 ) {
     let mut state = handoff
         .lock()
@@ -240,7 +248,14 @@ fn handle_position_report(
         let (x, y) = state.clamp_to_active_desktop(x, y);
         drop(state);
         position.reset(x, y);
-        routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+        // Delta continuo (no el primer `MouseMove` de un hand-off, que va
+        // por `apply_handoff_action` y siempre por TCP): tolera perderse,
+        // el próximo lo reemplaza — ver `core::udp_peers`. Si no hay peer
+        // UDP registrado (todavía no llegó su `UdpHello`, o no lo soporta),
+        // cae a la conexión confiable de siempre.
+        if !udp_peers.try_send_mouse_move(device, x, y) {
+            routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+        }
     }
 }
 
@@ -349,6 +364,7 @@ pub async fn run_wayland_input_session(
     barriers: Vec<BarrierSpec>,
     handoff: Arc<Mutex<HandoffState>>,
     routing: Arc<Routing>,
+    udp_peers: Arc<UdpPeers>,
 ) -> Result<(), InputError> {
     let failed = session.set_barriers(&barriers).await?;
     if !failed.is_empty() {
@@ -397,6 +413,7 @@ pub async fn run_wayland_input_session(
                     &mut session,
                     &handoff,
                     &routing,
+                    &udp_peers,
                     &mut current_activation,
                     &mut held,
                 )
@@ -437,11 +454,13 @@ async fn reclaim_if_peer_gone_wayland(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_wayland_event(
     event: WaylandCaptureEvent,
     session: &mut WaylandCaptureSession,
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Routing,
+    udp_peers: &UdpPeers,
     current_activation: &mut Option<u32>,
     held: &mut HeldGuard,
 ) {
@@ -487,17 +506,27 @@ async fn handle_wayland_event(
             *current_activation = None;
         }
         WaylandCaptureEvent::Input(captured) => {
-            handle_wayland_input(captured, session, handoff, routing, current_activation, held)
-                .await;
+            handle_wayland_input(
+                captured,
+                session,
+                handoff,
+                routing,
+                udp_peers,
+                current_activation,
+                held,
+            )
+            .await;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_wayland_input(
     event: CapturedEvent,
     session: &mut WaylandCaptureSession,
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Routing,
+    udp_peers: &UdpPeers,
     current_activation: &mut Option<u32>,
     held: &mut HeldGuard,
 ) {
@@ -544,7 +573,11 @@ async fn handle_wayland_input(
                 let (x, y) = guard.clamp_to_active_desktop(x, y);
                 drop(guard);
                 session.reset_position(x, y);
-                routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+                // Delta continuo — tolera perderse, ver el comentario
+                // equivalente en `handle_position_report` (X11).
+                if !udp_peers.try_send_mouse_move(device, x, y) {
+                    routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+                }
             }
         }
         CapturedEvent::MouseButton { button, pressed } => {

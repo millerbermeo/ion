@@ -1,7 +1,7 @@
 use ionconnect_protocol::{
     Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, Heartbeat,
     KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick, MouseMove, Reconnect,
-    Version, decode_message, encode_message,
+    UdpHello, Version, decode_message, encode_message,
 };
 use ionconnect_shared::{DeviceId, KeyModifiers};
 
@@ -92,6 +92,11 @@ fn display_geometry_round_trips() {
         width: 1366,
         height: 768,
     }));
+}
+
+#[test]
+fn udp_hello_round_trips() {
+    assert_round_trips(&Message::UdpHello(UdpHello { port: 51820 }));
 }
 
 #[test]

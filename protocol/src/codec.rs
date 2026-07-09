@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::error::ProtocolError;
 use crate::message::{
     Heartbeat, KeyboardPress, KeyboardRelease, Message, MessageType, MouseButton, MouseClick,
-    MouseMove,
+    MouseMove, UdpHello,
 };
 
 /// Codifica un [`Message`] a su representación binaria de wire.
@@ -68,6 +68,7 @@ pub fn encode_message_into(buf: &mut BytesMut, message: &Message) -> Result<(), 
         Message::Reconnect(payload) => encode_postcard(buf, payload)?,
         Message::Version(payload) => encode_postcard(buf, payload)?,
         Message::DisplayGeometry(payload) => encode_postcard(buf, payload)?,
+        Message::UdpHello(UdpHello { port }) => buf.put_u16_le(*port),
     }
 
     Ok(())
@@ -140,6 +141,12 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::DisplayGeometry => {
             Ok(Message::DisplayGeometry(postcard::from_bytes(buf)?))
         }
+        MessageType::UdpHello => {
+            require(buf, 2)?;
+            Ok(Message::UdpHello(UdpHello {
+                port: buf.get_u16_le(),
+            }))
+        }
     }
 }
 
@@ -172,5 +179,6 @@ const fn estimated_capacity(message: &Message) -> usize {
         Message::Disconnect(_) => 32,
         Message::Version(_) => 7,
         Message::DisplayGeometry(_) => 9,
+        Message::UdpHello(_) => 3,
     }
 }

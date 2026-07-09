@@ -16,6 +16,10 @@ ionconnect-protocol = { version = "0.1.0", path = "../protocol" }
 ionconnect-shared = { version = "0.1.0", path = "../shared" }
 mdns-sd = "0.20.1"
 rand = "0.10.2"
+# Ya está en el árbol de dependencias vía la feature "ring" de rustls (mismo
+# fingerprint criptográfico que ya se usa para TLS) — usarlo directo para
+# cifrar datagramas UDP no agrega superficie nueva de dependencias.
+ring = "0.17.14"
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15.0"
 thiserror = "2.0.18"

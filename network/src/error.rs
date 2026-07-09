@@ -10,4 +10,13 @@ pub enum NetworkError {
 
     #[error("error de descubrimiento mDNS: {0}")]
     Discovery(#[from] mdns_sd::Error),
+
+    #[error("error de cifrado/descifrado UDP")]
+    UdpCrypto,
+
+    #[error("secuencia UDP vieja o repetida, descartada")]
+    UdpStaleSequence,
+
+    #[error("datagrama UDP demasiado corto")]
+    UdpTruncated,
 }

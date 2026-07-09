@@ -38,6 +38,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         self.framed.send(message).await
     }
 
+    /// Acceso de solo lectura al transporte subyacente — para operaciones
+    /// que necesitan alcanzar la conexión TLS real por debajo (p. ej.
+    /// derivar material de clave para otro protocolo vía
+    /// `export_keying_material`, ver `core::server`/`core::client`) sin que
+    /// `Connection` tenga que saber nada de eso.
+    pub fn get_ref(&self) -> &T {
+        self.framed.get_ref()
+    }
+
     /// Espera el próximo mensaje. `Ok(None)` significa que el peer cerró la
     /// conexión ordenadamente.
     ///

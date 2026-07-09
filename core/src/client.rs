@@ -7,18 +7,22 @@ use std::time::Duration;
 use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
-use ionconnect_network::{BackoffPolicy, Connection, connect_tls, connect_with_backoff};
+use ionconnect_network::{
+    BackoffPolicy, Connection, UdpKey, connect_tls, connect_with_backoff, is_newer,
+    open_mouse_move,
+};
 use ionconnect_protocol::{
-    Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton,
+    Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton, UdpHello,
 };
 use ionconnect_shared::{DeviceId, KeyModifiers};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::client::TlsStream;
 use tracing::{info, warn};
 
 use crate::error::CoreError;
 use crate::identity::local_device_id;
+use crate::udp_peers::UDP_KEY_LABEL;
 
 type ClientConnection = Connection<TlsStream<TcpStream>>;
 
@@ -98,12 +102,33 @@ async fn run_single_session(
         );
     }
 
+    // Socket efímero para recibir los `MouseMove` continuos por UDP (ver
+    // `core::udp_peers`) — se deriva una clave nueva por sesión a partir de
+    // la conexión TLS ya autenticada, y se le avisa al servidor a qué
+    // puerto mandar. Se re-arma en cada reconexión a propósito: `seq`
+    // arranca de 0 de los dos lados, así que mezclarlo con el estado de una
+    // sesión anterior rompería la comprobación de frescura.
+    let udp_socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
+    let udp_port = udp_socket.local_addr()?.port();
+    let udp_key = {
+        let mut key_bytes = [0u8; 32];
+        conn.get_ref()
+            .get_ref()
+            .1
+            .export_keying_material(&mut key_bytes, UDP_KEY_LABEL, None)
+            .map_err(|e| CoreError::Other(format!("no se pudo derivar la clave UDP: {e}")))?;
+        UdpKey::new(&key_bytes)?
+    };
+    conn.send(Message::UdpHello(UdpHello { port: udp_port }))
+        .await?;
+    info!(port = udp_port, "puerto UDP anunciado al servidor");
+
     let mut injector = create_injector().await?;
     let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
-    session_loop(&mut conn, injector.as_mut(), &clipboard).await
+    session_loop(&mut conn, injector.as_mut(), &clipboard, &udp_socket, &udp_key).await
 }
 
 /// Resolución real del escritorio virtual de este equipo, para que el
@@ -221,20 +246,30 @@ async fn session_loop(
     conn: &mut ClientConnection,
     injector: &mut dyn InputInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    udp_socket: &UdpSocket,
+    udp_key: &UdpKey,
 ) -> Result<(), CoreError> {
     let mut held = HeldInput::default();
-    let result = session_loop_inner(conn, injector, clipboard, &mut held).await;
+    let result = session_loop_inner(conn, injector, clipboard, &mut held, udp_socket, udp_key).await;
     held.release_all(injector);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session_loop_inner(
     conn: &mut ClientConnection,
     injector: &mut dyn InputInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     held: &mut HeldInput,
+    udp_socket: &UdpSocket,
+    udp_key: &UdpKey,
 ) -> Result<(), CoreError> {
     let mut clipboard_ticker = tokio::time::interval(Duration::from_millis(500));
+    // `None` = todavía no se aceptó ningún `MouseMove` por UDP en esta
+    // sesión — el primero siempre se acepta, después se exige que la
+    // secuencia sea más nueva (ver `ionconnect_network::is_newer`).
+    let mut udp_last_seen: Option<u32> = None;
+    let mut udp_buf = [0u8; 64];
     loop {
         tokio::select! {
             incoming = conn.recv() => {
@@ -265,6 +300,27 @@ async fn session_loop_inner(
                     }
                     Some(Message::Disconnect(_)) | None => return Ok(()),
                     _ => {}
+                }
+            }
+            // Deltas continuos de MouseMove (ver `core::input_session` del
+            // lado servidor) — pérdida/desorden es tolerable acá, por eso
+            // van por UDP en vez de por `conn`. Un datagrama inválido o
+            // viejo se descarta con un log, nunca corta la sesión (a
+            // diferencia de `conn.recv()?` arriba, que si falla sí es
+            // fatal para la conexión confiable).
+            result = udp_socket.recv_from(&mut udp_buf) => {
+                match result {
+                    Ok((len, _from)) => match open_mouse_move(udp_key, &udp_buf[..len]) {
+                        Ok((seq, x, y)) => {
+                            let accept = udp_last_seen.is_none_or(|last| is_newer(seq, last));
+                            if accept {
+                                udp_last_seen = Some(seq);
+                                let _ = injector.inject(&CapturedEvent::MouseMove { x, y });
+                            }
+                        }
+                        Err(err) => warn!(%err, "datagrama UDP inválido, descartado"),
+                    },
+                    Err(err) => warn!(%err, "error leyendo el socket UDP de MouseMove"),
                 }
             }
             _ = clipboard_ticker.tick() => {

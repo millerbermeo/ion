@@ -6,11 +6,11 @@ use std::time::Duration;
 use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_crypto::PairingMode;
-use ionconnect_network::{Discovery, accept_tls};
+use ionconnect_network::{Discovery, UdpKey, accept_tls};
 use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message};
 use ionconnect_screen::{Layout, MonitorGeometry, ScreenEdge, VirtualDesktop};
 use ionconnect_shared::DeviceId;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -21,6 +21,7 @@ use crate::identity::local_device_id;
 use crate::peer_id;
 use crate::routing::Routing;
 use crate::trust_store::FileTrustStore;
+use crate::udp_peers::{UDP_KEY_LABEL, UdpPeers};
 
 /// Geometría de pantalla asumida para cada peer cuando no hay un mecanismo
 /// de intercambio de geometría real (fase futura): la misma resolución que
@@ -87,6 +88,14 @@ pub async fn run_server(
         "escuchando conexiones de peers"
     );
 
+    // Mismo número de puerto que el TCP: los namespaces UDP/TCP del SO son
+    // independientes, así que no chocan, y el usuario solo tiene que abrir
+    // un puerto en el firewall para las dos cosas. Ver `crate::udp_peers`
+    // para por qué el `MouseMove` continuo viaja por acá en vez de por la
+    // conexión TCP+TLS de siempre.
+    let udp_socket = Arc::new(UdpSocket::bind(("0.0.0.0", settings.listen_port)).await?);
+    let udp_peers = Arc::new(UdpPeers::new(udp_socket));
+
     // Se mantiene viva mientras dure el servidor: al soltarla, `mdns-sd`
     // deja de anunciar el servicio.
     let _discovery = if settings.discovery_enabled {
@@ -128,6 +137,7 @@ pub async fn run_server(
         settings.device_name.clone(),
         Arc::new(known_peers),
         routing.clone(),
+        udp_peers.clone(),
         clipboard,
         handoff.clone(),
     ));
@@ -142,7 +152,9 @@ pub async fn run_server(
         #[cfg(all(unix, not(target_os = "macos")))]
         crate::display::CaptureBackend::X11 => {
             tokio::task::spawn_blocking(move || {
-                if let Err(err) = crate::input_session::run_x11_input_session(&handoff, &routing) {
+                if let Err(err) =
+                    crate::input_session::run_x11_input_session(&handoff, &routing, &udp_peers)
+                {
                     tracing::error!(%err, "la sesión de captura de entrada terminó con error");
                 }
             });
@@ -165,7 +177,7 @@ pub async fn run_server(
             // los dos termina `run_server`.
             tokio::select! {
                 result = propagate_task(accept_handle) => result?,
-                result = crate::input_session::run_wayland_input_session(session, barriers, handoff, routing) => {
+                result = crate::input_session::run_wayland_input_session(session, barriers, handoff, routing, udp_peers) => {
                     if let Err(err) = result {
                         tracing::error!(%err, "la sesión de captura Wayland terminó con error");
                     }
@@ -190,6 +202,7 @@ async fn accept_connections(
     device_name: String,
     known_peers: Arc<HashMap<DeviceId, String>>,
     routing: Arc<Routing>,
+    udp_peers: Arc<UdpPeers>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
 ) -> Result<(), CoreError> {
@@ -198,6 +211,7 @@ async fn accept_connections(
         let server_config = server_config.clone();
         let known_peers = known_peers.clone();
         let routing = routing.clone();
+        let udp_peers = udp_peers.clone();
         let clipboard = clipboard.clone();
         let device_name = device_name.clone();
         let handoff = handoff.clone();
@@ -210,6 +224,7 @@ async fn accept_connections(
                 device_name,
                 known_peers,
                 routing,
+                udp_peers,
                 clipboard,
                 handoff,
             )
@@ -272,9 +287,16 @@ async fn handle_peer_connection(
     device_name: String,
     known_peers: Arc<HashMap<DeviceId, String>>,
     routing: Arc<Routing>,
+    udp_peers: Arc<UdpPeers>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
 ) -> Result<(), CoreError> {
+    // Hace falta antes de mover `tcp` a `accept_tls`: es la IP que se
+    // combina con el puerto que reporte el cliente en `UdpHello` para armar
+    // el destino UDP (ver más abajo) — el cliente no tiene forma de conocer
+    // su propia IP tal como la ve el servidor (NAT, múltiples interfaces).
+    let peer_ip = tcp.peer_addr()?.ip();
+
     let mut conn = accept_tls(tcp, server_config).await?;
 
     let Some(Message::Authentication(auth)) = conn.recv().await? else {
@@ -298,6 +320,19 @@ async fn handle_peer_connection(
     .await?;
 
     info!(device_id = %auth.device_id, name = %auth.device_name, "peer autenticado");
+
+    // Se deriva una sola vez por sesión TLS, apenas termina el handshake —
+    // sin RTT extra, hereda la autenticación TOFU mutua. Ver
+    // `network::udp_codec` para el porqué de este mecanismo.
+    let udp_key = {
+        let mut key_bytes = [0u8; 32];
+        conn.get_ref()
+            .get_ref()
+            .1
+            .export_keying_material(&mut key_bytes, UDP_KEY_LABEL, None)
+            .map_err(|e| CoreError::Other(format!("no se pudo derivar la clave UDP: {e}")))?;
+        Arc::new(UdpKey::new(&key_bytes).map_err(CoreError::Network)?)
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     routing.register(auth.device_id, tx);
@@ -332,6 +367,15 @@ async fn handle_peer_connection(
                                 )]),
                             );
                     }
+                    Some(Message::UdpHello(hello)) => {
+                        let addr = std::net::SocketAddr::new(peer_ip, hello.port);
+                        info!(
+                            device_id = %auth.device_id,
+                            %addr,
+                            "peer registrado para MouseMove por UDP"
+                        );
+                        udp_peers.register(auth.device_id, addr, udp_key.clone());
+                    }
                     Some(Message::Disconnect(_)) | None => break,
                     _ => {}
                 }
@@ -343,6 +387,7 @@ async fn handle_peer_connection(
     }
 
     routing.unregister(auth.device_id);
+    udp_peers.unregister(auth.device_id);
     info!(device_id = %auth.device_id, "peer desconectado");
     Ok(())
 }
@@ -417,6 +462,12 @@ mod tests {
         let mut known_peers = HashMap::new();
         known_peers.insert(client_device, "cliente-de-prueba".to_string());
         let routing = Arc::new(Routing::new());
+        let udp_socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind UDP no debería fallar"),
+        );
+        let udp_peers = Arc::new(UdpPeers::new(udp_socket));
         let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
             ArboardProvider::new().expect("abrir el portapapeles no debería fallar"),
         )));
@@ -442,6 +493,7 @@ mod tests {
                     "servidor-de-prueba".to_string(),
                     Arc::new(known_peers),
                     routing,
+                    udp_peers,
                     clipboard,
                     handoff,
                 )

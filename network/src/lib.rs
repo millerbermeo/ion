@@ -12,6 +12,7 @@ mod discovery;
 mod error;
 mod heartbeat;
 mod tls;
+mod udp_codec;
 
 pub use backoff::{Backoff, BackoffPolicy, connect_with_backoff};
 pub use codec::MessageCodec;
@@ -20,3 +21,4 @@ pub use discovery::{DiscoveredPeer, Discovery, peer_from_event};
 pub use error::NetworkError;
 pub use heartbeat::HeartbeatMonitor;
 pub use tls::{accept_tls, connect_tls};
+pub use udp_codec::{UdpKey, is_newer, open_mouse_move, seal_mouse_move};
