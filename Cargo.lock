@@ -1944,8 +1944,10 @@ name = "ionconnect-input"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "futures-util",
  "ionconnect-protocol",
  "ionconnect-shared",
+ "reis",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3144,6 +3146,19 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reis"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3fedd2777cde52c1be5e572efbec485eac7b801c47820eda388d4f13b9c4b"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "log",
+ "rustix",
+ "tokio",
+]
 
 [[package]]
 name = "reqwest"

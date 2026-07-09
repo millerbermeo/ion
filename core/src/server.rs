@@ -8,13 +8,14 @@ use ionconnect_config::Settings;
 use ionconnect_crypto::PairingMode;
 use ionconnect_network::{Discovery, accept_tls};
 use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message};
-use ionconnect_screen::{Layout, MonitorGeometry, VirtualDesktop};
+use ionconnect_screen::{Layout, MonitorGeometry, ScreenEdge, VirtualDesktop};
 use ionconnect_shared::DeviceId;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::display::LocalDisplay;
 use crate::error::CoreError;
 use crate::identity::local_device_id;
 use crate::peer_id;
@@ -43,8 +44,12 @@ fn peer_desktop(local_geometry: MonitorGeometry) -> VirtualDesktop {
 pub async fn run_server(
     settings: Settings,
     config_dir: &Path,
-    local_geometry: MonitorGeometry,
+    local_display: LocalDisplay,
 ) -> Result<(), CoreError> {
+    let LocalDisplay {
+        geometry: local_geometry,
+        backend,
+    } = local_display;
     let identity = crate::identity::load_or_generate_identity(config_dir)?;
     let local_device = local_device_id(&identity);
     info!(device_id = %local_device, "identidad local cargada");
@@ -62,6 +67,7 @@ pub async fn run_server(
     let mut layout = Layout::new();
     layout.set_desktop(local_device, peer_desktop(local_geometry));
     let mut known_peers: HashMap<DeviceId, String> = HashMap::new();
+    let mut peer_edges: Vec<(DeviceId, ScreenEdge)> = Vec::new();
     for peer in &settings.peers {
         let Some(peer_device) = peer_id::from_hex(&peer.device_id) else {
             warn!(device_id = %peer.device_id, "device_id de peer mal formado, se ignora");
@@ -70,6 +76,7 @@ pub async fn run_server(
         layout.set_desktop(peer_device, peer_desktop(local_geometry));
         layout.link_mirrored(local_device, peer.edge, peer_device);
         known_peers.insert(peer_device, peer.name.clone());
+        peer_edges.push((peer_device, peer.edge));
         info!(name = %peer.name, edge = ?peer.edge, "borde de hand-off configurado");
     }
 
@@ -108,16 +115,88 @@ pub async fn run_server(
         layout,
         local_device,
     )));
-    spawn_input_session(handoff, routing.clone());
 
-    let known_peers = Arc::new(known_peers);
+    // El accept-loop no toca nada del backend de captura, así que es
+    // seguro moverlo a una tarea de fondo con `tokio::spawn` en todos los
+    // casos — a diferencia de la sesión Wayland (ver más abajo), que por
+    // los internos de `reis` no es `Send` y tiene que quedarse en la
+    // tarea/hilo que la conectó.
+    let accept_handle = tokio::spawn(accept_connections(
+        listener,
+        server_config,
+        local_device,
+        settings.device_name.clone(),
+        Arc::new(known_peers),
+        routing.clone(),
+        clipboard,
+    ));
+
+    match backend {
+        crate::display::CaptureBackend::Unsupported => {
+            tracing::error!(
+                "no hay backend de captura de entrada disponible en este equipo — no va a capturar ni reenviar entrada"
+            );
+            propagate_task(accept_handle).await?;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        crate::display::CaptureBackend::X11 => {
+            tokio::task::spawn_blocking(move || {
+                if let Err(err) = crate::input_session::run_x11_input_session(&handoff, &routing) {
+                    tracing::error!(%err, "la sesión de captura de entrada terminó con error");
+                }
+            });
+            propagate_task(accept_handle).await?;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        crate::display::CaptureBackend::Wayland(session) => {
+            let barriers: Vec<ionconnect_input::wayland::BarrierSpec> = peer_edges
+                .iter()
+                .enumerate()
+                .map(|(index, (_device, edge))| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let id = index as u32 + 1;
+                    barrier_for_edge(id, local_geometry, *edge)
+                })
+                .collect();
+            // Corre inline (nunca `tokio::spawn`) para no necesitar que
+            // `WaylandCaptureSession` sea `Send` — cruza igual que el
+            // accept-loop vía `select!`, así un error en cualquiera de
+            // los dos termina `run_server`.
+            tokio::select! {
+                result = propagate_task(accept_handle) => result?,
+                result = crate::input_session::run_wayland_input_session(session, barriers, handoff, routing) => {
+                    if let Err(err) = result {
+                        tracing::error!(%err, "la sesión de captura Wayland terminó con error");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn propagate_task(handle: tokio::task::JoinHandle<Result<(), CoreError>>) -> Result<(), CoreError> {
+    handle
+        .await
+        .map_err(|e| CoreError::Other(e.to_string()))?
+}
+
+async fn accept_connections(
+    listener: TcpListener,
+    server_config: Arc<rustls::ServerConfig>,
+    local_device: DeviceId,
+    device_name: String,
+    known_peers: Arc<HashMap<DeviceId, String>>,
+    routing: Arc<Routing>,
+    clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+) -> Result<(), CoreError> {
     loop {
         let (tcp, addr) = listener.accept().await?;
         let server_config = server_config.clone();
         let known_peers = known_peers.clone();
         let routing = routing.clone();
         let clipboard = clipboard.clone();
-        let device_name = settings.device_name.clone();
+        let device_name = device_name.clone();
 
         tokio::spawn(async move {
             let result = handle_peer_connection(
@@ -137,33 +216,47 @@ pub async fn run_server(
     }
 }
 
-/// La sesión de captura real solo existe en X11 (ver `input_session`, que a
-/// su vez depende de `ionconnect_input::x11`, gateado a
-/// `cfg(all(unix, not(target_os = "macos")))`). En cualquier otra
-/// plataforma, elegir `Role::Server` deja el servicio escuchando y
-/// autenticando peers con normalidad, pero sin nada que capturar ni
-/// reenviar — se loguea una sola vez en vez de fallar la compilación o el
-/// arranque entero.
+/// Posición de la barrera del portal `InputCapture` correspondiente al
+/// borde `edge` de `bounds` — misma convención que usan los ejemplos de
+/// `ashpd`/`reis`: el lado "externo" (el que da hacia afuera de la
+/// pantalla) va sin restar 1, el lado que corre a lo largo del borde sí.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn spawn_input_session(
-    handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
-    routing: Arc<Routing>,
-) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = crate::input_session::run_x11_input_session(&handoff, &routing) {
-            tracing::error!(%err, "la sesión de captura de entrada terminó con error");
-        }
-    });
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn spawn_input_session(
-    _handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
-    _routing: Arc<Routing>,
-) {
-    tracing::error!(
-        "el rol Server todavía no está soportado en este sistema operativo (solo Linux/X11 por ahora, ver README) — este equipo no va a capturar ni reenviar entrada"
-    );
+fn barrier_for_edge(
+    id: u32,
+    bounds: MonitorGeometry,
+    edge: ScreenEdge,
+) -> ionconnect_input::wayland::BarrierSpec {
+    use ionconnect_input::wayland::BarrierSpec;
+    match edge {
+        ScreenEdge::Left => BarrierSpec {
+            id,
+            x1: bounds.left(),
+            y1: bounds.top(),
+            x2: bounds.left(),
+            y2: bounds.bottom() - 1,
+        },
+        ScreenEdge::Right => BarrierSpec {
+            id,
+            x1: bounds.right(),
+            y1: bounds.top(),
+            x2: bounds.right(),
+            y2: bounds.bottom() - 1,
+        },
+        ScreenEdge::Top => BarrierSpec {
+            id,
+            x1: bounds.left(),
+            y1: bounds.top(),
+            x2: bounds.right() - 1,
+            y2: bounds.top(),
+        },
+        ScreenEdge::Bottom => BarrierSpec {
+            id,
+            x1: bounds.left(),
+            y1: bounds.bottom(),
+            x2: bounds.right() - 1,
+            y2: bounds.bottom(),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

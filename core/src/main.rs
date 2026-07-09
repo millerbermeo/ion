@@ -1,4 +1,5 @@
 mod client;
+mod display;
 mod error;
 mod handoff;
 mod identity;
@@ -67,34 +68,7 @@ fn main() {
 }
 
 async fn run_server(settings: Settings, dir: &std::path::Path) -> Result<(), CoreError> {
-    let geometry = local_screen_geometry();
+    let local_display = display::detect_local_display().await;
     info!("iniciando como servidor");
-    server::run_server(settings, dir, geometry).await
-}
-
-/// Ancho/alto reales de la pantalla local, para que el `Layout` de
-/// hand-off detecte el borde donde de verdad termina el escritorio (antes
-/// esto era un `1920x1080` fijo, incorrecto en cualquier monitor de otra
-/// resolución o en multi-monitor).
-#[cfg(all(unix, not(target_os = "macos")))]
-fn local_screen_geometry() -> ionconnect_screen::MonitorGeometry {
-    match ionconnect_input::x11::X11Control::root_geometry() {
-        Ok((width, height)) => ionconnect_screen::MonitorGeometry::new(0, 0, width, height),
-        Err(err) => {
-            warn!(
-                %err,
-                "no se pudo consultar la geometría real de pantalla, usando 1920x1080 por defecto"
-            );
-            ionconnect_screen::MonitorGeometry::new(0, 0, 1920, 1080)
-        }
-    }
-}
-
-/// El rol Server todavía no captura entrada fuera de X11 (ver
-/// `server::spawn_input_session`), así que en el resto de plataformas esta
-/// geometría no se usa para nada funcional — solo hace falta un valor con
-/// el que construir el `Layout`.
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn local_screen_geometry() -> ionconnect_screen::MonitorGeometry {
-    ionconnect_screen::MonitorGeometry::new(0, 0, 1920, 1080)
+    server::run_server(settings, dir, local_display).await
 }
