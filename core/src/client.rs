@@ -19,7 +19,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::CoreError;
 use crate::identity::local_device_id;
@@ -129,7 +129,7 @@ async fn run_single_session(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
-    session_loop(&mut conn, injector.as_mut(), &clipboard, &udp_socket, &udp_key).await
+    session_loop(&mut conn, &mut injector, &clipboard, &udp_socket, &udp_key).await
 }
 
 /// Resolución real del escritorio virtual de este equipo, para que el
@@ -168,6 +168,40 @@ fn local_display_geometry() -> Option<DisplayGeometry> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// Inyector ya elegido para esta sesión.
+///
+/// El backend del portal de Wayland vive en su propia variante en vez de
+/// detrás del `dyn InputInjector` sincrónico a propósito: su implementación
+/// sincrónica tiene que bloquear un hilo del runtime (`block_in_place`) en
+/// **cada** evento para poder esperar la llamada D-Bus. A cientos de eventos
+/// por segundo eso no solo cuesta el traspaso de hilo — impide que el bucle
+/// de sesión vacíe el socket UDP mientras tanto, así que los movimientos se
+/// acumulan y después se reproducen en ráfaga: se percibe como cortes y
+/// arrastre. Esperando la llamada de forma async no se bloquea ningún hilo y
+/// el bucle sigue atendiendo el resto.
+enum ClientInjector {
+    /// Backends nativamente sincrónicos y baratos (X11 vía XTEST, Windows
+    /// vía `SendInput`): inyectar es una llamada local, no un round trip.
+    Sync(Box<dyn InputInjector>),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    WaylandPortal(Box<ionconnect_input::wayland::WaylandPortalInjector>),
+}
+
+impl ClientInjector {
+    /// Un fallo puntual de inyección no corta la sesión: se descarta ese
+    /// evento (mismo criterio que antes de existir este enum).
+    async fn inject(&mut self, event: &CapturedEvent) {
+        let result = match self {
+            Self::Sync(injector) => injector.inject(event),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::WaylandPortal(injector) => injector.inject_async(event).await,
+        };
+        if let Err(err) = result {
+            debug!(%err, "no se pudo inyectar un evento");
+        }
+    }
 }
 
 /// Teclas y botones que este equipo inyectó como presionados y todavía no
@@ -216,21 +250,25 @@ impl HeldInput {
         }
     }
 
-    fn release_all(&mut self, injector: &mut dyn InputInjector) {
+    async fn release_all(&mut self, injector: &mut ClientInjector) {
         for keycode in self.keys.drain() {
             warn!(keycode, "liberando tecla que quedó pegada al cortarse la sesión");
-            let _ = injector.inject(&CapturedEvent::Key {
-                keycode,
-                modifiers: KeyModifiers::NONE,
-                pressed: false,
-            });
+            injector
+                .inject(&CapturedEvent::Key {
+                    keycode,
+                    modifiers: KeyModifiers::NONE,
+                    pressed: false,
+                })
+                .await;
         }
         for button in self.buttons.drain() {
             warn!(?button, "liberando botón que quedó pegado al cortarse la sesión");
-            let _ = injector.inject(&CapturedEvent::MouseButton {
-                button,
-                pressed: false,
-            });
+            injector
+                .inject(&CapturedEvent::MouseButton {
+                    button,
+                    pressed: false,
+                })
+                .await;
         }
     }
 }
@@ -279,7 +317,7 @@ async fn poll_clipboard_changes(
 /// ver [`HeldInput`] — y detiene el sondeo del portapapeles de esta sesión.
 async fn session_loop(
     conn: &mut ClientConnection,
-    injector: &mut dyn InputInjector,
+    injector: &mut ClientInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
@@ -302,14 +340,39 @@ async fn session_loop(
     // Cada reconexión arranca su propio sondeo: sin esto se acumularía uno
     // por sesión, todos leyendo el mismo portapapeles.
     poller.abort();
-    held.release_all(injector);
+    held.release_all(injector).await;
     result
+}
+
+/// Descifra un datagrama y devuelve su posición solo si es más nueva que la
+/// última aceptada, actualizando `last_seen`. Un datagrama viejo, repetido o
+/// inválido se descarta sin cortar nada — es exactamente la tolerancia a
+/// pérdida y reordenamiento que justifica usar UDP acá.
+fn accept_mouse_move(
+    udp_key: &UdpKey,
+    datagram: &[u8],
+    last_seen: &mut Option<u32>,
+) -> Option<(i32, i32)> {
+    match open_mouse_move(udp_key, datagram) {
+        Ok((seq, x, y)) => {
+            if last_seen.is_none_or(|last| is_newer(seq, last)) {
+                *last_seen = Some(seq);
+                Some((x, y))
+            } else {
+                None
+            }
+        }
+        Err(err) => {
+            warn!(%err, "datagrama UDP inválido, descartado");
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn session_loop_inner(
     conn: &mut ClientConnection,
-    injector: &mut dyn InputInjector,
+    injector: &mut ClientInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     held: &mut HeldInput,
     udp_socket: &UdpSocket,
@@ -326,22 +389,22 @@ async fn session_loop_inner(
             incoming = conn.recv() => {
                 match incoming? {
                     Some(Message::MouseMove(m)) => {
-                        let _ = injector.inject(&CapturedEvent::MouseMove { x: m.x, y: m.y });
+                        injector.inject(&CapturedEvent::MouseMove { x: m.x, y: m.y }).await;
                     }
                     Some(Message::MouseClick(c)) => {
                         let event = CapturedEvent::MouseButton { button: c.button, pressed: c.pressed };
                         held.track(&event);
-                        let _ = injector.inject(&event);
+                        injector.inject(&event).await;
                     }
                     Some(Message::KeyboardPress(k)) => {
                         let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: true };
                         held.track(&event);
-                        let _ = injector.inject(&event);
+                        injector.inject(&event).await;
                     }
                     Some(Message::KeyboardRelease(k)) => {
                         let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: false };
                         held.track(&event);
-                        let _ = injector.inject(&event);
+                        injector.inject(&event).await;
                     }
                     Some(Message::ClipboardSync(sync)) => {
                         if let Ok(text) = String::from_utf8(sync.data) {
@@ -361,16 +424,43 @@ async fn session_loop_inner(
             // fatal para la conexión confiable).
             result = udp_socket.recv_from(&mut udp_buf) => {
                 match result {
-                    Ok((len, _from)) => match open_mouse_move(udp_key, &udp_buf[..len]) {
-                        Ok((seq, x, y)) => {
-                            let accept = udp_last_seen.is_none_or(|last| is_newer(seq, last));
-                            if accept {
-                                udp_last_seen = Some(seq);
-                                let _ = injector.inject(&CapturedEvent::MouseMove { x, y });
+                    Ok((len, _from)) => {
+                        let mut freshest = accept_mouse_move(
+                            udp_key, &udp_buf[..len], &mut udp_last_seen,
+                        );
+
+                        // Vaciar de una lo que ya esté encolado en el socket y
+                        // quedarse solo con la posición más nueva. Inyectarlas
+                        // todas en fila sería reproducir un rastro viejo: cada
+                        // inyección cuesta (en Wayland, un round trip D-Bus),
+                        // así que con el enlace cargado el cursor se arrastra
+                        // detrás de la mano en vez de saltar a donde está de
+                        // verdad. Como `MouseMove` lleva posición absoluta, la
+                        // última sola basta — las intermedias no aportan nada.
+                        let mut dropped = 0u32;
+                        loop {
+                            match udp_socket.try_recv_from(&mut udp_buf) {
+                                Ok((len, _from)) => {
+                                    if let Some(newer) = accept_mouse_move(
+                                        udp_key, &udp_buf[..len], &mut udp_last_seen,
+                                    ) {
+                                        if freshest.is_some() {
+                                            dropped += 1;
+                                        }
+                                        freshest = Some(newer);
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         }
-                        Err(err) => warn!(%err, "datagrama UDP inválido, descartado"),
-                    },
+                        if dropped > 0 {
+                            debug!(dropped, "posiciones intermedias descartadas al vaciar el socket UDP");
+                        }
+
+                        if let Some((x, y)) = freshest {
+                            injector.inject(&CapturedEvent::MouseMove { x, y }).await;
+                        }
+                    }
                     Err(err) => warn!(%err, "error leyendo el socket UDP de MouseMove"),
                 }
             }
@@ -399,13 +489,39 @@ async fn session_loop_inner(
 /// quedarse sin inyectar solo porque `DISPLAY` no estaba puesto. Sin esta
 /// cadena, un cliente Linux que fallara en su backend preferido terminaba el
 /// proceso en vez de conectarse igual.
-async fn create_injector() -> Result<Box<dyn InputInjector>, CoreError> {
+async fn create_injector() -> Result<ClientInjector, CoreError> {
     #[cfg(windows)]
     {
-        return Ok(Box::new(ionconnect_input::win32::WindowsInjector::new()));
+        return Ok(ClientInjector::Sync(Box::new(
+            ionconnect_input::win32::WindowsInjector::new(),
+        )));
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // Escotilla de escape para comparar backends sin recompilar:
+        // `IONCONNECT_INJECT_BACKEND=x11` fuerza XTEST incluso en una sesión
+        // Wayland. Inyectar por XTEST es una llamada local, mientras que el
+        // portal cuesta un round trip D-Bus por evento, así que en
+        // compositores que reenvían XTEST desde XWayland al sistema entero
+        // (GNOME/mutter, por ejemplo) forzar x11 puede ser bastante más
+        // fluido. En los que no lo hacen, la inyección solo llegaría a las
+        // aplicaciones X11, y por eso no es el valor por defecto.
+        let forced = std::env::var("IONCONNECT_INJECT_BACKEND").ok();
+        if let Some(forced) = forced.as_deref() {
+            let backend = match forced {
+                "x11" => Some(Backend::X11),
+                "wayland" => Some(Backend::Wayland),
+                other => {
+                    warn!(backend = other, "IONCONNECT_INJECT_BACKEND desconocido, se ignora");
+                    None
+                }
+            };
+            if let Some(backend) = backend {
+                info!(backend = backend.name(), "backend de inyección forzado por entorno");
+                return connect_backend(backend).await;
+            }
+        }
+
         let prefers_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
             || (std::env::var_os("WAYLAND_DISPLAY").is_some()
                 && std::env::var_os("DISPLAY").is_none());
@@ -468,14 +584,14 @@ impl Backend {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-async fn connect_backend(backend: Backend) -> Result<Box<dyn InputInjector>, CoreError> {
+async fn connect_backend(backend: Backend) -> Result<ClientInjector, CoreError> {
     match backend {
         Backend::X11 => ionconnect_input::x11::X11Injector::connect()
-            .map(|injector| Box::new(injector) as Box<dyn InputInjector>)
+            .map(|injector| ClientInjector::Sync(Box::new(injector)))
             .map_err(CoreError::Input),
         Backend::Wayland => ionconnect_input::wayland::WaylandPortalInjector::connect()
             .await
-            .map(|injector| Box::new(injector) as Box<dyn InputInjector>)
+            .map(|injector| ClientInjector::WaylandPortal(Box::new(injector)))
             .map_err(CoreError::Input),
     }
 }
@@ -484,28 +600,91 @@ async fn connect_backend(backend: Backend) -> Result<Box<dyn InputInjector>, Cor
 mod tests {
     use super::*;
 
-    #[derive(Default)]
+    fn sealed(key: &UdpKey, seq: u32, x: i32, y: i32) -> Vec<u8> {
+        ionconnect_network::seal_mouse_move(key, seq, x, y)
+    }
+
+    #[test]
+    fn accepts_the_first_datagram_and_then_only_newer_ones() {
+        let key = UdpKey::new(&[7u8; 32]).expect("32 bytes es el largo correcto");
+        let mut last_seen = None;
+
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 0, 10, 20), &mut last_seen),
+            Some((10, 20)),
+            "el primero siempre se acepta"
+        );
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 1, 11, 21), &mut last_seen),
+            Some((11, 21))
+        );
+        // Reordenado: llega uno viejo después del nuevo.
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 0, 99, 99), &mut last_seen),
+            None,
+            "un datagrama viejo no debería moverse el cursor hacia atrás"
+        );
+        // Repetido exacto del último aceptado.
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 1, 11, 21), &mut last_seen),
+            None
+        );
+    }
+
+    #[test]
+    fn a_corrupt_datagram_is_discarded_without_touching_the_freshness_state() {
+        let key = UdpKey::new(&[7u8; 32]).expect("32 bytes es el largo correcto");
+        let mut last_seen = None;
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 5, 1, 2), &mut last_seen),
+            Some((1, 2))
+        );
+
+        assert_eq!(accept_mouse_move(&key, b"basura", &mut last_seen), None);
+        // El estado quedó intacto: el siguiente legítimo sigue entrando.
+        assert_eq!(
+            accept_mouse_move(&key, &sealed(&key, 6, 3, 4), &mut last_seen),
+            Some((3, 4))
+        );
+    }
+
+    /// Registra lo inyectado en un `Vec` compartido: `ClientInjector` toma
+    /// el inyector por `Box`, así que el test necesita seguir viendo lo que
+    /// pasó desde afuera.
+    #[derive(Clone, Default)]
     struct RecordingInjector {
-        injected: Vec<CapturedEvent>,
+        injected: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl RecordingInjector {
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.injected.lock().expect("lock sano").clone()
+        }
     }
 
     impl InputInjector for RecordingInjector {
         fn inject(&mut self, event: &CapturedEvent) -> Result<(), ionconnect_input::InputError> {
-            self.injected.push(*event);
+            self.injected.lock().expect("lock sano").push(*event);
             Ok(())
         }
     }
 
-    #[test]
-    fn release_all_is_a_noop_when_nothing_is_held() {
-        let mut held = HeldInput::default();
-        let mut injector = RecordingInjector::default();
-        held.release_all(&mut injector);
-        assert!(injector.injected.is_empty());
+    fn recording() -> (RecordingInjector, ClientInjector) {
+        let recorder = RecordingInjector::default();
+        let injector = ClientInjector::Sync(Box::new(recorder.clone()));
+        (recorder, injector)
     }
 
-    #[test]
-    fn tracks_and_releases_a_key_left_pressed() {
+    #[tokio::test]
+    async fn release_all_is_a_noop_when_nothing_is_held() {
+        let mut held = HeldInput::default();
+        let (recorder, mut injector) = recording();
+        held.release_all(&mut injector).await;
+        assert!(recorder.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracks_and_releases_a_key_left_pressed() {
         let mut held = HeldInput::default();
         held.track(&CapturedEvent::Key {
             keycode: 30,
@@ -513,11 +692,11 @@ mod tests {
             pressed: true,
         });
 
-        let mut injector = RecordingInjector::default();
-        held.release_all(&mut injector);
+        let (recorder, mut injector) = recording();
+        held.release_all(&mut injector).await;
 
         assert_eq!(
-            injector.injected,
+            recorder.events(),
             vec![CapturedEvent::Key {
                 keycode: 30,
                 modifiers: KeyModifiers::NONE,
@@ -525,13 +704,13 @@ mod tests {
             }]
         );
         // Ya se liberó — un segundo `release_all` no debería mandar nada de nuevo.
-        let mut injector = RecordingInjector::default();
-        held.release_all(&mut injector);
-        assert!(injector.injected.is_empty());
+        let (recorder, mut injector) = recording();
+        held.release_all(&mut injector).await;
+        assert!(recorder.events().is_empty());
     }
 
-    #[test]
-    fn a_matching_release_clears_the_held_key_before_disconnect() {
+    #[tokio::test]
+    async fn a_matching_release_clears_the_held_key_before_disconnect() {
         let mut held = HeldInput::default();
         held.track(&CapturedEvent::Key {
             keycode: 30,
@@ -544,24 +723,24 @@ mod tests {
             pressed: false,
         });
 
-        let mut injector = RecordingInjector::default();
-        held.release_all(&mut injector);
-        assert!(injector.injected.is_empty());
+        let (recorder, mut injector) = recording();
+        held.release_all(&mut injector).await;
+        assert!(recorder.events().is_empty());
     }
 
-    #[test]
-    fn tracks_and_releases_a_held_mouse_button() {
+    #[tokio::test]
+    async fn tracks_and_releases_a_held_mouse_button() {
         let mut held = HeldInput::default();
         held.track(&CapturedEvent::MouseButton {
             button: MouseButton::Left,
             pressed: true,
         });
 
-        let mut injector = RecordingInjector::default();
-        held.release_all(&mut injector);
+        let (recorder, mut injector) = recording();
+        held.release_all(&mut injector).await;
 
         assert_eq!(
-            injector.injected,
+            recorder.events(),
             vec![CapturedEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: false,
