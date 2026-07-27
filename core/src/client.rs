@@ -17,7 +17,7 @@ use ionconnect_protocol::{
 use ionconnect_shared::{DeviceId, KeyModifiers};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 
@@ -124,12 +124,12 @@ async fn run_single_session(
         .await?;
     info!(port = udp_port, "puerto UDP anunciado al servidor");
 
-    let mut injector = create_injector().await?;
+    let injector = create_injector().await?;
     let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
-    session_loop(&mut conn, &mut injector, &clipboard, &udp_socket, &udp_key).await
+    session_loop(&mut conn, injector, &clipboard, &udp_socket, &udp_key).await
 }
 
 /// Resolución real del escritorio virtual de este equipo, para que el
@@ -313,11 +313,12 @@ async fn poll_clipboard_changes(
 }
 
 /// Sea cual sea el motivo de salida (desconexión limpia o error de red vía
-/// `?`), libera cualquier tecla/botón que haya quedado a medio presionar —
-/// ver [`HeldInput`] — y detiene el sondeo del portapapeles de esta sesión.
+/// `?`), la tarea de inyección libera cualquier tecla/botón que haya quedado
+/// a medio presionar — ver [`HeldInput`] — y se detiene el sondeo del
+/// portapapeles de esta sesión.
 async fn session_loop(
     conn: &mut ClientConnection,
-    injector: &mut ClientInjector,
+    injector: ClientInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
@@ -325,12 +326,19 @@ async fn session_loop(
     let (clipboard_tx, clipboard_rx) = mpsc::channel(4);
     let poller = tokio::spawn(poll_clipboard_changes(clipboard.clone(), clipboard_tx));
 
-    let mut held = HeldInput::default();
+    // La inyección corre en su propia tarea, desacoplada del bucle de red
+    // (ver `injection_task` para el porqué). El movimiento va por un `watch`
+    // — coalesce solo, únicamente sobrevive la posición más fresca — y lo
+    // discreto (teclas, clicks) por una cola acotada que preserva el orden.
+    let (moves_tx, moves_rx) = watch::channel(None);
+    let (discrete_tx, discrete_rx) = mpsc::channel(128);
+    let injection = tokio::spawn(injection_task(injector, moves_rx, discrete_rx));
+
     let result = session_loop_inner(
         conn,
-        injector,
+        &moves_tx,
+        &discrete_tx,
         clipboard,
-        &mut held,
         udp_socket,
         udp_key,
         clipboard_rx,
@@ -340,8 +348,95 @@ async fn session_loop(
     // Cada reconexión arranca su propio sondeo: sin esto se acumularía uno
     // por sesión, todos leyendo el mismo portapapeles.
     poller.abort();
-    held.release_all(injector).await;
+    // Cerrar los dos canales le avisa a la tarea de inyección que la sesión
+    // terminó: drena lo discreto pendiente, libera lo que quedó presionado
+    // (`HeldInput::release_all`) y recién ahí termina — por eso se la espera
+    // antes de devolver el control al bucle de reconexión.
+    drop(moves_tx);
+    drop(discrete_tx);
+    if let Err(err) = injection.await {
+        warn!(%err, "la tarea de inyección terminó mal");
+    }
     result
+}
+
+/// Inyecta lo que llega por los canales, fuera del bucle de red.
+///
+/// El porqué de la tarea aparte: en el backend Wayland cada inyección es un
+/// round trip D-Bus al portal (milisegundos), y cuando eso se esperaba
+/// dentro del mismo `select!` que recibía la red, todo lo demás quedaba
+/// detrás — el teclado se sentía trabado porque cada tecla hacía cola detrás
+/// de una racha de movimientos, y cada movimiento pagaba su round trip
+/// entero antes de mirar el siguiente. Acá el bucle de red nunca espera una
+/// inyección: publica y sigue leyendo.
+///
+/// El orden se cuida en dos frentes:
+/// - `biased` hacia la cola discreta: una tecla o click se inyecta apenas
+///   llega, sin esperar a que se drene el movimiento (que coalesce solo en
+///   el `watch`, así que nunca hay "racha" acumulada que drenar).
+/// - Antes de cada evento discreto se aplica la posición más fresca aún no
+///   inyectada: un click debe caer donde el cursor está *ahora*, no donde
+///   estaba en la última inyección de movimiento.
+async fn injection_task(
+    mut injector: ClientInjector,
+    mut moves: watch::Receiver<Option<(i32, i32)>>,
+    mut discrete: mpsc::Receiver<CapturedEvent>,
+) {
+    let mut held = HeldInput::default();
+    // Deduplicación por valor en vez de por la marca "visto" del `watch`:
+    // `has_changed()` devuelve `Err` apenas el emisor se cierra aunque quede
+    // un valor sin ver, y la marca tampoco distingue "cambió a lo mismo".
+    // Como `MouseMove` es posición absoluta, comparar contra la última
+    // inyectada es exacto y no depende del estado del canal.
+    let mut last_injected: Option<(i32, i32)> = None;
+    loop {
+        tokio::select! {
+            biased;
+            event = discrete.recv() => {
+                let Some(event) = event else { break };
+                // Posición fresca primero — ver el comentario del doc.
+                let position = *moves.borrow_and_update();
+                inject_move_if_new(&mut injector, position, &mut last_injected).await;
+                held.track(&event);
+                injector.inject(&event).await;
+            }
+            changed = moves.changed() => {
+                match changed {
+                    Ok(()) => {
+                        // `borrow` devuelve el más nuevo aunque haya vuelto
+                        // a cambiar entre el aviso y esta lectura.
+                        let position = *moves.borrow();
+                        inject_move_if_new(&mut injector, position, &mut last_injected).await;
+                    }
+                    // El emisor se cerró: la sesión terminó.
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    // Drenar los release que hayan quedado encolados antes de liberar a
+    // ciegas: así `HeldInput` ve la liberación real y `release_all` no
+    // manda un release duplicado.
+    while let Ok(event) = discrete.try_recv() {
+        held.track(&event);
+        injector.inject(&event).await;
+    }
+    held.release_all(&mut injector).await;
+}
+
+/// Inyecta `position` solo si difiere de la última ya inyectada — ver el
+/// comentario sobre `last_injected` en [`injection_task`].
+async fn inject_move_if_new(
+    injector: &mut ClientInjector,
+    position: Option<(i32, i32)>,
+    last_injected: &mut Option<(i32, i32)>,
+) {
+    if position.is_none() || position == *last_injected {
+        return;
+    }
+    let Some((x, y)) = position else { return };
+    *last_injected = position;
+    injector.inject(&CapturedEvent::MouseMove { x, y }).await;
 }
 
 /// Descifra un datagrama y devuelve su posición solo si es más nueva que la
@@ -369,12 +464,27 @@ fn accept_mouse_move(
     }
 }
 
+/// Manda un evento discreto (tecla, click) a la tarea de inyección. Si la
+/// cola está llena espera — a tasa humana de tecleo nunca pasa; si pasa es
+/// que el backend de inyección está colgado y frenar acá es lo correcto.
+/// `Err` = la tarea de inyección murió: se corta la sesión para reconectar
+/// con un inyector nuevo en vez de seguir descartando entrada en silencio.
+async fn send_discrete(
+    discrete_tx: &mpsc::Sender<CapturedEvent>,
+    event: CapturedEvent,
+) -> Result<(), CoreError> {
+    discrete_tx
+        .send(event)
+        .await
+        .map_err(|_| CoreError::Other("la tarea de inyección terminó inesperadamente".to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn session_loop_inner(
     conn: &mut ClientConnection,
-    injector: &mut ClientInjector,
+    moves_tx: &watch::Sender<Option<(i32, i32)>>,
+    discrete_tx: &mpsc::Sender<CapturedEvent>,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
-    held: &mut HeldInput,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
     mut clipboard_rx: mpsc::Receiver<String>,
@@ -389,22 +499,19 @@ async fn session_loop_inner(
             incoming = conn.recv() => {
                 match incoming? {
                     Some(Message::MouseMove(m)) => {
-                        injector.inject(&CapturedEvent::MouseMove { x: m.x, y: m.y }).await;
+                        // Camino de respaldo TCP (antes del `UdpHello` del
+                        // lado servidor) — mismo `watch` que el UDP: solo
+                        // importa la posición más fresca.
+                        let _ = moves_tx.send(Some((m.x, m.y)));
                     }
                     Some(Message::MouseClick(c)) => {
-                        let event = CapturedEvent::MouseButton { button: c.button, pressed: c.pressed };
-                        held.track(&event);
-                        injector.inject(&event).await;
+                        send_discrete(discrete_tx, CapturedEvent::MouseButton { button: c.button, pressed: c.pressed }).await?;
                     }
                     Some(Message::KeyboardPress(k)) => {
-                        let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: true };
-                        held.track(&event);
-                        injector.inject(&event).await;
+                        send_discrete(discrete_tx, CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: true }).await?;
                     }
                     Some(Message::KeyboardRelease(k)) => {
-                        let event = CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: false };
-                        held.track(&event);
-                        injector.inject(&event).await;
+                        send_discrete(discrete_tx, CapturedEvent::Key { keycode: k.keycode, modifiers: k.modifiers, pressed: false }).await?;
                     }
                     Some(Message::ClipboardSync(sync)) => {
                         if let Ok(text) = String::from_utf8(sync.data) {
@@ -430,27 +537,21 @@ async fn session_loop_inner(
                         );
 
                         // Vaciar de una lo que ya esté encolado en el socket y
-                        // quedarse solo con la posición más nueva. Inyectarlas
-                        // todas en fila sería reproducir un rastro viejo: cada
-                        // inyección cuesta (en Wayland, un round trip D-Bus),
-                        // así que con el enlace cargado el cursor se arrastra
-                        // detrás de la mano en vez de saltar a donde está de
-                        // verdad. Como `MouseMove` lleva posición absoluta, la
-                        // última sola basta — las intermedias no aportan nada.
+                        // quedarse solo con la posición más nueva: `MouseMove`
+                        // lleva posición absoluta, así que las intermedias no
+                        // aportan nada y publicarlas una por una solo haría
+                        // girar este bucle de más. El `watch` hacia la tarea
+                        // de inyección coalesce igual, pero drenar acá evita
+                        // despertar el `select!` una vez por datagrama viejo.
                         let mut dropped = 0u32;
-                        loop {
-                            match udp_socket.try_recv_from(&mut udp_buf) {
-                                Ok((len, _from)) => {
-                                    if let Some(newer) = accept_mouse_move(
-                                        udp_key, &udp_buf[..len], &mut udp_last_seen,
-                                    ) {
-                                        if freshest.is_some() {
-                                            dropped += 1;
-                                        }
-                                        freshest = Some(newer);
-                                    }
+                        while let Ok((len, _from)) = udp_socket.try_recv_from(&mut udp_buf) {
+                            if let Some(newer) = accept_mouse_move(
+                                udp_key, &udp_buf[..len], &mut udp_last_seen,
+                            ) {
+                                if freshest.is_some() {
+                                    dropped += 1;
                                 }
-                                Err(_) => break,
+                                freshest = Some(newer);
                             }
                         }
                         if dropped > 0 {
@@ -458,7 +559,7 @@ async fn session_loop_inner(
                         }
 
                         if let Some((x, y)) = freshest {
-                            injector.inject(&CapturedEvent::MouseMove { x, y }).await;
+                            let _ = moves_tx.send(Some((x, y)));
                         }
                     }
                     Err(err) => warn!(%err, "error leyendo el socket UDP de MouseMove"),
@@ -522,9 +623,24 @@ async fn create_injector() -> Result<ClientInjector, CoreError> {
             }
         }
 
-        let prefers_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
-            || (std::env::var_os("WAYLAND_DISPLAY").is_some()
-                && std::env::var_os("DISPLAY").is_none());
+        // GNOME/mutter reenvía la entrada XTEST de XWayland al sistema
+        // entero, así que ahí XTEST inyecta igual de completo que el portal
+        // pero con una llamada local en vez de un round trip D-Bus por
+        // evento — diferencia enorme de fluidez a cientos de eventos por
+        // segundo. En GNOME se prefiere x11 aun en sesión Wayland; si
+        // XWayland no está, `connect_backend` falla y la cadena cae al
+        // portal igual que siempre. Otros compositores no garantizan ese
+        // reenvío, por eso la preferencia es solo para GNOME.
+        let desktop_relays_xtest = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| {
+            desktop
+                .split(':')
+                .any(|part| part.eq_ignore_ascii_case("gnome"))
+        });
+
+        let prefers_wayland = !desktop_relays_xtest
+            && (std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
+                || (std::env::var_os("WAYLAND_DISPLAY").is_some()
+                    && std::env::var_os("DISPLAY").is_none()));
 
         let (first, second) = if prefers_wayland {
             (Backend::Wayland, Backend::X11)
@@ -726,6 +842,97 @@ mod tests {
         let (recorder, mut injector) = recording();
         held.release_all(&mut injector).await;
         assert!(recorder.events().is_empty());
+    }
+
+    /// Todo lo encolado antes de arrancar la tarea se procesa en un orden
+    /// determinista (el `select!` es `biased` hacia lo discreto), así que se
+    /// puede afirmar la secuencia exacta: la posición más fresca coalescida
+    /// se inyecta antes del click, y las intermedias nunca se inyectan.
+    #[tokio::test]
+    async fn injection_task_applies_the_freshest_move_before_a_click() {
+        let (moves_tx, moves_rx) = watch::channel(None);
+        let (discrete_tx, discrete_rx) = mpsc::channel(8);
+
+        moves_tx.send(Some((1, 1))).expect("receiver vivo");
+        moves_tx.send(Some((5, 7))).expect("receiver vivo");
+        discrete_tx
+            .send(CapturedEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            })
+            .await
+            .expect("receiver vivo");
+        discrete_tx
+            .send(CapturedEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            })
+            .await
+            .expect("receiver vivo");
+        drop(moves_tx);
+        drop(discrete_tx);
+
+        let (recorder, injector) = recording();
+        tokio::spawn(injection_task(injector, moves_rx, discrete_rx))
+            .await
+            .expect("la tarea no debería entrar en panic");
+
+        assert_eq!(
+            recorder.events(),
+            vec![
+                // La (1, 1) intermedia coalesció: nunca se inyecta.
+                CapturedEvent::MouseMove { x: 5, y: 7 },
+                CapturedEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+                CapturedEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: false,
+                },
+                // El release ya llegó por la cola — `release_all` no duplica.
+            ]
+        );
+    }
+
+    /// Si la sesión se corta con una tecla a medio presionar, la propia
+    /// tarea la libera al terminar (antes esto vivía en `session_loop`).
+    #[tokio::test]
+    async fn injection_task_releases_held_keys_on_shutdown() {
+        let (moves_tx, moves_rx) = watch::channel(None);
+        let (discrete_tx, discrete_rx) = mpsc::channel(8);
+
+        discrete_tx
+            .send(CapturedEvent::Key {
+                keycode: 30,
+                modifiers: KeyModifiers::NONE,
+                pressed: true,
+            })
+            .await
+            .expect("receiver vivo");
+        drop(moves_tx);
+        drop(discrete_tx);
+
+        let (recorder, injector) = recording();
+        tokio::spawn(injection_task(injector, moves_rx, discrete_rx))
+            .await
+            .expect("la tarea no debería entrar en panic");
+
+        assert_eq!(
+            recorder.events(),
+            vec![
+                CapturedEvent::Key {
+                    keycode: 30,
+                    modifiers: KeyModifiers::NONE,
+                    pressed: true,
+                },
+                CapturedEvent::Key {
+                    keycode: 30,
+                    modifiers: KeyModifiers::NONE,
+                    pressed: false,
+                },
+            ]
+        );
     }
 
     #[tokio::test]

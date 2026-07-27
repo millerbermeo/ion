@@ -28,6 +28,11 @@ cargo clippy --workspace --exclude ionconnect-gui
 
 # run a node locally against ~/.config/ionconnect/config.toml
 cargo run -p ionconnect-core
+
+# the X11 tests that need a real X server are #[ignore]d — run them in a
+# nested display, never against your own session (they inject keys/clicks)
+Xephyr :80 -screen 800x600 -ac &
+DISPLAY=:80 cargo test -p ionconnect-input --test x11_smoke -- --ignored --test-threads=1
 ```
 
 Linux build dependencies (for the GUI/Tauri crate and packaging): `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`, `build-essential`.
@@ -65,8 +70,17 @@ Cargo workspace, one crate per responsibility (`Cargo.toml` lists members). Depe
 **Client** (`core/src/client.rs`):
 - Connects with exponential backoff (`connect_with_backoff`), authenticates, reports its real display geometry (`DisplayGeometry` message) so the server can replace its assumed geometry.
 - `session_loop` is one `tokio::select!` over: reliable TCP+TLS messages (clicks, key events, clipboard), the UDP `MouseMove` stream, and a channel carrying already-detected clipboard changes. Clipboard *reading* deliberately happens in a separate task on a blocking thread — it is a synchronous call into the X server/compositor that can stall for hundreds of milliseconds, and doing it inline froze input injection.
-- `create_injector` tries both Linux backends (preferred one first, by session type) rather than committing to one: `XDG_SESSION_TYPE=wayland` does not guarantee the `RemoteDesktop` portal is usable, and a Wayland session usually still has an XWayland that XTEST can reach.
-- `HeldInput` tracks pressed-but-not-yet-released keys/buttons and force-releases them if the session drops, to avoid stuck modifiers/buttons at the OS level.
+- **Injection is decoupled from the network loop** (`injection_task`): the session loop never awaits an injection — it publishes motion into a `tokio::sync::watch` (only the freshest absolute position survives; dedup is by value against the last injected position, not the watch's "seen" flag, which turns `Err` on sender close) and discrete events (keys/clicks) into a bounded ordered `mpsc`. The task's `select!` is `biased` toward the discrete queue so a key press never waits behind a burst of motion, but injects the freshest not-yet-applied position *before* each discrete event so clicks land where the cursor is now. This exists because each Wayland-portal injection is a D-Bus round trip; awaiting it inline made the keyboard queue behind stale motion.
+- On each UDP wakeup the socket is still **drained to the freshest datagram** (`accept_mouse_move` + `try_recv_from` loop) before publishing to the watch — the watch would coalesce anyway, but draining avoids waking the loop once per stale datagram.
+- `create_injector` tries both Linux backends (preferred one first) rather than committing to one: `XDG_SESSION_TYPE=wayland` does not guarantee the `RemoteDesktop` portal is usable, and a Wayland session usually still has an XWayland that XTEST can reach. On GNOME (`XDG_CURRENT_DESKTOP` contains `GNOME`) X11/XTEST is preferred even in a Wayland session, because mutter relays XWayland's XTEST system-wide and a local XTEST call beats the portal's per-event D-Bus round trip; other compositors don't guarantee that relay, so they keep preferring the portal. `IONCONNECT_INJECT_BACKEND=x11|wayland` forces one without recompiling.
+- Injection goes through `ClientInjector`, **not** the sync `InputInjector` trait directly. The Wayland portal backend is held in its own variant so its `inject_async` can be awaited: its sync `InputInjector` impl has to `block_in_place` to await the D-Bus call, which costs a thread handoff per event. Don't collapse this back into `Box<dyn InputInjector>`.
+- `HeldInput` lives inside `injection_task` (it tracks what was actually injected): pressed-but-not-yet-released keys/buttons are force-released when the task shuts down — after draining any queued releases so nothing is released twice — to avoid stuck modifiers/buttons at the OS level.
+
+### XI2 raw events must be selected on the master device
+
+`X11Capture` selects raw events with `deviceid = 1` (`XIAllMasterDevices`), not `0` (`XIAllDevices`). With `0` the server delivers **every raw event twice** — once for the slave that generated it, once for its master (measured: 2 raw presses vs 1). That is not a cosmetic duplicate: each `XI_RawMotion` delta was accumulated twice, so the remote cursor moved at double the physical speed. `capture_reports_a_key_press_and_release` asserts the exact event sequence and fails if this regresses.
+
+Cooked (`KEY_PRESS`/`BUTTON_PRESS`) selection is not an alternative — it follows normal focus-based window propagation, so a focused app consumes the events before they reach our root-window selection. Raw events are delivered regardless of focus or grabs, which is also why capture keeps working after the pointer is grabbed and confined at the edge.
 
 ### Key repeat is synthesized, not captured
 
@@ -75,6 +89,14 @@ Neither capture backend delivers OS auto-repeat: X11's `XI_RawKeyPress` reports 
 ### Why MouseMove has its own UDP transport
 
 Continuous mouse deltas are latency-sensitive and loss-tolerant, so they bypass the reliable TCP+TLS `Connection` and go over a session-scoped encrypted UDP channel instead (`network/src/udp_codec.rs` + `core/src/udp_peers.rs`). The UDP key is derived via TLS `export_keying_material` right after the TLS handshake — no extra round trip, and it inherits the mutual TOFU authentication of the TLS session. Sequence numbers (`seq`) double as the AEAD nonce source and as a freshness check (`network::is_newer`) so old/replayed/reordered datagrams are dropped rather than applied. `seq` resets to 0 each session, which is why the UDP socket is rebound and the key rederived on every reconnect.
+
+### Pairing: the default config cannot pair
+
+TLS here is mutual, so **both** ends must trust each other's certificate fingerprint. `Settings::default()` ships `pairing_mode = RejectUnknown` and the trust store starts empty, so two fresh installs can never pair — the client loops forever on `certificado desconocido rechazado (posible MITM)` while the server waits. There is no pairing window in the GUI yet; the only ways out are flipping `pairing_mode` to `auto-trust-on-first-use` on the side that needs to learn, or appending the peer's fingerprint by hand.
+
+The store is `~/.config/ionconnect/trusted_fingerprints`: one 64-char lowercase hex SHA-256 of the peer's cert DER per line. `parse_hex_fingerprint` drops any line whose length isn't exactly 64, and the file is written **without a trailing newline** — appending with a plain `echo` silently corrupts the last entry into a 128-char line that is then ignored. A machine's own fingerprint is `openssl x509 -in ~/.config/ionconnect/identity.crt -outform DER | sha256sum`.
+
+Note the server also rejects, *after* the TLS handshake, any peer whose `DeviceId` is not in its configured `peers` list — so a trusted fingerprint alone is not enough to be routed input.
 
 ### Screen geometry assumption
 
