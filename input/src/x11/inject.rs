@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::xproto::{
     BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
@@ -22,6 +24,11 @@ fn x11_error(err: impl std::fmt::Display) -> InputError {
 pub struct X11Injector {
     conn: RustConnection,
     root: Window,
+    /// Teclas que este inyector marcó como presionadas y todavía no soltó,
+    /// para reconocer una repetición (una pulsación de algo que ya está
+    /// mantenido) — ver [`X11Injector::inject`] para qué se hace distinto
+    /// en ese caso.
+    held_keys: HashSet<u8>,
 }
 
 impl X11Injector {
@@ -36,7 +43,11 @@ impl X11Injector {
         conn.extension_information(xtest::X11_EXTENSION_NAME)
             .map_err(x11_error)?
             .ok_or(InputError::MissingX11Extension("XTEST"))?;
-        Ok(Self { conn, root })
+        Ok(Self {
+            conn,
+            root,
+            held_keys: HashSet::new(),
+        })
     }
 }
 
@@ -69,17 +80,36 @@ impl InputInjector for X11Injector {
                 // `x11::capture::x11_keycode_to_evdev`) — hay que sumarle
                 // de vuelta el offset de 8 que usa XKB antes de mandarlo a
                 // `xtest_fake_input`, que espera keycodes X11 nativos.
-                let event_type = if pressed {
-                    KEY_PRESS_EVENT
-                } else {
-                    KEY_RELEASE_EVENT
-                };
                 let code = u8::try_from(keycode.saturating_add(8)).map_err(|_| {
                     InputError::X11Connection(format!("keycode fuera de rango: {keycode}"))
                 })?;
-                self.conn
-                    .xtest_fake_input(event_type, code, 0, self.root, 0, 0, 0)
-                    .map_err(x11_error)?;
+                if pressed {
+                    // Una pulsación de algo que ya está mantenido es una
+                    // repetición sintetizada por el emisor (ver
+                    // `core::key_repeat`). No alcanza con reenviarla tal
+                    // cual: una tecla mantenida vía XTEST hace que *este*
+                    // servidor X arranque además su propio auto-repeat
+                    // (medido: 22 repeticiones en 1,5 s a partir de una sola
+                    // pulsación XTEST), así que sumar las nuestras encima
+                    // daría el doble de velocidad. Mandar release+press
+                    // entrega exactamente una repetición a las aplicaciones
+                    // y de paso reinicia el temporizador de auto-repeat
+                    // local, que por eso nunca llega a dispararse mientras
+                    // las repeticiones remotas sigan llegando.
+                    if !self.held_keys.insert(code) {
+                        self.conn
+                            .xtest_fake_input(KEY_RELEASE_EVENT, code, 0, self.root, 0, 0, 0)
+                            .map_err(x11_error)?;
+                    }
+                    self.conn
+                        .xtest_fake_input(KEY_PRESS_EVENT, code, 0, self.root, 0, 0, 0)
+                        .map_err(x11_error)?;
+                } else {
+                    self.held_keys.remove(&code);
+                    self.conn
+                        .xtest_fake_input(KEY_RELEASE_EVENT, code, 0, self.root, 0, 0, 0)
+                        .map_err(x11_error)?;
+                }
             }
         }
         self.conn.flush().map_err(x11_error)?;

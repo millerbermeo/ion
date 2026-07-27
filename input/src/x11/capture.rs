@@ -18,10 +18,19 @@ fn x11_error(err: impl std::fmt::Display) -> InputError {
     InputError::X11Connection(err.to_string())
 }
 
-/// El protocolo XI2 identifica "todos los dispositivos" con el id 0 (no hay
-/// una constante nombrada para esto en `x11rb`; es un valor fijo de la
-/// especificación `XInput2`, sección 4).
-const XI_ALL_DEVICES: u16 = 0;
+/// El protocolo XI2 identifica "todos los dispositivos maestros" con el id 1
+/// (no hay una constante nombrada para esto en `x11rb`; es un valor fijo de
+/// la especificación `XInput2`, sección 4).
+///
+/// Seleccionar acá el id 0 ("todos los dispositivos", maestros *y* esclavos)
+/// entrega **cada evento crudo dos veces**: una por la selección del esclavo
+/// que lo generó y otra por la del maestro al que está adosado. Medido
+/// contra un servidor X real (ver `input/tests/x11_smoke.rs`,
+/// `raw_events_are_not_duplicated_with_master_device_selection`): 2 eventos
+/// por pulsación con el id 0, exactamente 1 con el id 1. En movimiento eso
+/// además duplicaba el delta acumulado, así que el cursor remoto avanzaba al
+/// doble de la velocidad física real.
+const XI_ALL_MASTER_DEVICES: u16 = 1;
 
 /// Posición acumulada compartida entre el hilo de captura (que la actualiza
 /// a partir de deltas crudos) y quien orquesta la sesión (que la reinicia
@@ -112,20 +121,26 @@ impl X11Capture {
             .map_err(x11_error)?;
 
         // Botones/teclas van en su variante `RAW_*`, igual que el
-        // movimiento — a propósito, aunque eso puede reportar una pulsación
-        // duplicada en algunos casos (ver `core::input_session::HeldGuard`,
-        // que la absorbe del lado de `core`). Se probó seleccionar la
-        // variante "cocida" (`KEY_PRESS`/`BUTTON_PRESS`) solo en el
-        // dispositivo maestro para evitar esa duplicación, pero rompió la
-        // captura por completo en un escritorio real: los eventos cocidos
-        // siguen la propagación normal de ventanas por foco, así que una
-        // vez que cualquier aplicación enfocada los consume (algo que pasa
-        // todo el tiempo en un escritorio real, a diferencia de una sesión
-        // Xephyr vacía), nunca llegan a nuestra selección sobre el root.
-        // Los eventos `RAW_*` no tienen ese problema — se entregan sin
-        // importar foco ni grabs, que es justamente por lo que ya se usaba
-        // `RAW_MOTION` para seguir viendo el mouse más allá del borde una
-        // vez agarrado y confinado el puntero.
+        // movimiento. Se probó seleccionar la variante "cocida"
+        // (`KEY_PRESS`/`BUTTON_PRESS`), pero rompió la captura por completo
+        // en un escritorio real: los eventos cocidos siguen la propagación
+        // normal de ventanas por foco, así que una vez que cualquier
+        // aplicación enfocada los consume (algo que pasa todo el tiempo en
+        // un escritorio real, a diferencia de una sesión Xephyr vacía),
+        // nunca llegan a nuestra selección sobre el root. Los eventos
+        // `RAW_*` no tienen ese problema — se entregan sin importar foco ni
+        // grabs, que es justamente por lo que ya se usaba `RAW_MOTION` para
+        // seguir viendo el mouse más allá del borde una vez agarrado y
+        // confinado el puntero. La duplicación que se veía antes no venía de
+        // ser "crudos" sino de seleccionarlos sobre el id 0 en vez del 1;
+        // ver [`XI_ALL_MASTER_DEVICES`].
+        //
+        // Nota sobre el auto-repeat del sistema: los eventos `RAW_*` **no**
+        // incluyen las repeticiones que genera el servidor X al mantener una
+        // tecla (medido: 1 solo `RAW_KEY_PRESS` frente a 22 eventos cocidos
+        // en 1,5 s). Por eso las repeticiones se sintetizan del lado de
+        // `core` a partir del estado de teclas mantenidas — ver
+        // `core::key_repeat`.
         let mask = XIEventMask::MOTION
             | XIEventMask::RAW_MOTION
             | XIEventMask::RAW_BUTTON_PRESS
@@ -133,7 +148,7 @@ impl X11Capture {
             | XIEventMask::RAW_KEY_PRESS
             | XIEventMask::RAW_KEY_RELEASE;
         let events = [EventMask {
-            deviceid: XI_ALL_DEVICES,
+            deviceid: XI_ALL_MASTER_DEVICES,
             mask: vec![mask],
         }];
         conn.xinput_xi_select_events(root, &events)

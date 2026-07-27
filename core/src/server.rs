@@ -392,6 +392,12 @@ async fn handle_peer_connection(
     Ok(())
 }
 
+/// Cada lectura va a un hilo bloqueante porque leer el portapapeles es una
+/// llamada síncrona que habla con el servidor X/compositor y puede tardar
+/// cientos de milisegundos si la aplicación que lo posee está ocupada. Hecho
+/// directamente sobre la tarea async, eso bloquea un hilo del runtime
+/// mientras retiene el mutex del portapapeles, y con él a cualquier peer que
+/// justo esté aplicando un cambio remoto.
 async fn broadcast_local_clipboard_changes(
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     routing: Arc<Routing>,
@@ -399,12 +405,22 @@ async fn broadcast_local_clipboard_changes(
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     loop {
         ticker.tick().await;
-        let changed = clipboard.lock().await.poll_once();
-        if let Ok(Some(text)) = changed {
-            routing.broadcast(&Message::ClipboardSync(ClipboardSync {
-                mime: ClipboardMime::Text,
-                data: text.into_bytes(),
-            }));
+        let clipboard = clipboard.clone();
+        let polled =
+            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_once()).await;
+        match polled {
+            Ok(Ok(Some(text))) => {
+                routing.broadcast(&Message::ClipboardSync(ClipboardSync {
+                    mime: ClipboardMime::Text,
+                    data: text.into_bytes(),
+                }));
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => warn!(%err, "error leyendo el portapapeles"),
+            Err(err) => {
+                warn!(%err, "la tarea de lectura del portapapeles terminó mal");
+                break;
+            }
         }
     }
 }

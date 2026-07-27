@@ -120,55 +120,67 @@ fn capture_reports_a_key_press_and_release() {
     let mut injector = X11Injector::connect().expect("XTEST debería estar disponible");
     // Keycode evdev 30 = 'a' (ver `x11_keycode_to_evdev`/`X11Injector::inject`,
     // que le suma/resta el offset de 8 que usa XKB).
+    let press = CapturedEvent::Key {
+        keycode: 30,
+        modifiers: ionconnect_shared::KeyModifiers::NONE,
+        pressed: true,
+    };
+    let release = CapturedEvent::Key {
+        keycode: 30,
+        modifiers: ionconnect_shared::KeyModifiers::NONE,
+        pressed: false,
+    };
+    injector.inject(&press).expect("presionar no debería fallar");
+    injector.inject(&release).expect("soltar no debería fallar");
     injector
-        .inject(&CapturedEvent::Key {
-            keycode: 30,
-            modifiers: ionconnect_shared::KeyModifiers::NONE,
-            pressed: true,
-        })
-        .expect("presionar la tecla no debería fallar");
+        .inject(&press)
+        .expect("volver a presionar no debería fallar");
+    // Segunda pulsación sin soltar: una repetición sintetizada por el emisor
+    // (ver `core::key_repeat`), que el inyector convierte en release+press.
     injector
-        .inject(&CapturedEvent::Key {
-            keycode: 30,
-            modifiers: ionconnect_shared::KeyModifiers::NONE,
-            pressed: false,
-        })
-        .expect("soltar la tecla no debería fallar");
+        .inject(&press)
+        .expect("la repetición no debería fallar");
+    injector
+        .inject(&release)
+        .expect("el release final no debería fallar");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut presses = 0u32;
-    let mut releases = 0u32;
+    let mut sequence = Vec::new();
     while std::time::Instant::now() < deadline {
         let Ok(event) =
             rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         else {
             break;
         };
-        match event {
-            CapturedEvent::Key {
-                keycode: 30,
-                pressed: true,
-                ..
-            } => presses += 1,
-            CapturedEvent::Key {
-                keycode: 30,
-                pressed: false,
-                ..
-            } => releases += 1,
-            _ => {}
+        if let CapturedEvent::Key {
+            keycode: 30,
+            pressed,
+            ..
+        } = event
+        {
+            sequence.push(pressed);
         }
     }
 
     drop(handle);
-    // No se exige exactamente 1: `XI_RawKeyPress`/`RawKeyRelease` pueden
-    // llegar duplicados según el servidor X (confirmado en Xephyr, donde
-    // `XTEST` se relaya a través de dos dispositivos esclavos) — acá solo
-    // se prueba que la captura funciona. La deduplicación real vive en
-    // `core::input_session::HeldGuard` (ver su test unitario), no en este
-    // crate: depende de estado (¿ya está presionada?), no de la semántica
-    // fina de selección de eventos de cada backend de captura.
-    assert!(presses >= 1, "se esperaba capturar la tecla presionada");
-    assert!(releases >= 1, "se esperaba capturar la tecla soltada");
+    // Esta secuencia exacta cubre dos garantías a la vez:
+    //
+    // 1. Ningún evento duplicado. Seleccionar los eventos crudos sobre
+    //    `XIAllMasterDevices` en vez de `XIAllDevices` es lo que evita que el
+    //    servidor entregue la misma pulsación dos veces (una por el esclavo
+    //    que la generó y otra por su maestro). Si vuelve a duplicarse esto
+    //    da el doble de elementos — y la regresión no sería cosmética: el
+    //    mismo defecto duplicaba los deltas de movimiento y hacía que el
+    //    cursor remoto avanzara al doble de velocidad.
+    // 2. La repetición viaja como release+press (el par del medio) para que
+    //    las aplicaciones del receptor vean una pulsación nueva y se
+    //    reinicie el temporizador de auto-repeat propio del servidor X
+    //    local, que si no se sumaría al nuestro.
+    assert_eq!(
+        sequence,
+        vec![true, false, true, false, true, false],
+        "se esperaba press, release, press, el release+press de la repetición y el release final"
+    );
 }
 
 #[test]

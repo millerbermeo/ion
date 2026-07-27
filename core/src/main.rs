@@ -5,6 +5,7 @@ mod handoff;
 mod identity;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod input_session;
+mod key_repeat;
 mod peer_id;
 mod routing;
 mod server;

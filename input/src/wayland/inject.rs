@@ -63,6 +63,10 @@ pub struct WaylandPortalInjector {
     portal: RemoteDesktop,
     session: Session<RemoteDesktop>,
     last_position: Option<(f64, f64)>,
+    /// Teclas marcadas como presionadas y todavía no soltadas, para
+    /// distinguir una repetición de una pulsación nueva — ver el manejo de
+    /// `CapturedEvent::Key` en [`WaylandPortalInjector::inject_async`].
+    held_keys: std::collections::HashSet<i32>,
 }
 
 impl WaylandPortalInjector {
@@ -103,10 +107,24 @@ impl WaylandPortalInjector {
             portal,
             session,
             last_position: None,
+            held_keys: std::collections::HashSet::new(),
         })
     }
 
-    async fn inject_async(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
+    /// Camino async nativo de este backend. Preferirlo desde código ya
+    /// async: el `InputInjector::inject` síncrono tiene que bloquear un hilo
+    /// del runtime para llegar acá.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`InputError::Portal`] si el portal rechaza la petición o la
+    /// sesión ya no es válida.
+    ///
+    /// # Panics
+    ///
+    /// Nunca en la práctica: el único `expect` interno vuelve a consultar
+    /// un `scroll_axis` que la guarda del propio `match` ya comprobó.
+    pub async fn inject_async(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
         match *event {
             // Solo tiene sentido del lado de captura; no hay nada que inyectar.
             CapturedEvent::AbsolutePosition { .. } => Ok(()),
@@ -172,35 +190,63 @@ impl WaylandPortalInjector {
             } => {
                 // NOTA: mismo hueco de normalización de keycodes que los
                 // backends X11/Win32 — ver comentario en `x11::inject`.
-                let state = if pressed {
-                    KeyState::Pressed
-                } else {
-                    KeyState::Released
-                };
                 let keycode = i32::try_from(keycode).map_err(|_| {
                     InputError::Unsupported("keycode fuera de rango para el portal")
                 })?;
-                self.portal
-                    .notify_keyboard_keycode(
-                        &self.session,
-                        keycode,
-                        state,
-                        NotifyKeyboardKeycodeOptions::default(),
-                    )
-                    .await
-                    .map_err(portal_error)
+                if !pressed {
+                    self.held_keys.remove(&keycode);
+                    return self
+                        .notify_key(keycode, KeyState::Released)
+                        .await;
+                }
+                // Pulsación de una tecla ya mantenida = repetición
+                // sintetizada por el emisor (ver `core::key_repeat`). Se
+                // manda soltar-y-volver-a-apretar por el mismo motivo que en
+                // `x11::inject`: el compositor arranca su propio auto-repeat
+                // con la tecla virtual mantenida, y reiniciarle el
+                // temporizador en cada repetición remota evita que las dos
+                // fuentes se sumen.
+                if !self.held_keys.insert(keycode) {
+                    self.notify_key(keycode, KeyState::Released).await?;
+                }
+                self.notify_key(keycode, KeyState::Pressed).await
             }
         }
+    }
+
+    async fn notify_key(&self, keycode: i32, state: KeyState) -> Result<(), InputError> {
+        self.portal
+            .notify_keyboard_keycode(
+                &self.session,
+                keycode,
+                state,
+                NotifyKeyboardKeycodeOptions::default(),
+            )
+            .await
+            .map_err(portal_error)
     }
 }
 
 impl InputInjector for WaylandPortalInjector {
-    /// Bloquea el hilo actual sobre un runtime de tokio para ejecutar la
-    /// llamada D-Bus async subyacente. Este backend está pensado para
-    /// llamarse desde `tokio::task::spawn_blocking`, igual que los backends
-    /// síncronos de X11/Windows, así el resto de `core` no necesita saber
-    /// que este camino en particular es async por dentro.
+    /// Bloquea el hilo actual sobre el runtime de tokio para ejecutar la
+    /// llamada D-Bus async subyacente, de modo que el resto de `core` no
+    /// necesite saber que este camino en particular es async por dentro.
+    ///
+    /// El `block_in_place` no es decorativo: sin él, `Handle::block_on`
+    /// entra en panic con *"Cannot start a runtime from within a runtime"*
+    /// apenas se lo llama desde una tarea async — que es exactamente lo que
+    /// hace `core::client::session_loop` al inyectar el primer evento
+    /// recibido. `block_in_place` mueve el resto de las tareas a otro hilo
+    /// del runtime antes de bloquear, y con eso la llamada anidada pasa a
+    /// ser válida.
+    ///
+    /// Requiere el runtime multi-hilo (el que crea `core::main` con
+    /// `Runtime::new()`); sobre un runtime `current_thread` no hay a dónde
+    /// mover las tareas y `block_in_place` entra en panic por diseño.
     fn inject(&mut self, event: &CapturedEvent) -> Result<(), InputError> {
-        tokio::runtime::Handle::current().block_on(self.inject_async(event))
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.inject_async(event))
+        })
     }
 }
+

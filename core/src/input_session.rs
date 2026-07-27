@@ -1,28 +1,167 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ionconnect_input::wayland::{BarrierSpec, WaylandCaptureEvent, WaylandCaptureSession};
-use ionconnect_input::x11::{SharedPosition, X11Capture, X11Control};
+use ionconnect_input::x11::{KeyRepeatSettings, SharedPosition, X11Capture, X11Control};
 use ionconnect_input::{CapturedEvent, InputCapture as _, InputError};
 use ionconnect_protocol::{
     KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick, MouseMove,
 };
-use ionconnect_shared::DeviceId;
-use tracing::{info, warn};
+use ionconnect_shared::{DeviceId, KeyModifiers};
+use tracing::{debug, info, warn};
 
 use crate::handoff::{Active, HandoffAction, HandoffState};
+use crate::key_repeat::KeyRepeater;
 use crate::routing::Routing;
 use crate::udp_peers::UdpPeers;
 
-/// Filtra pulsaciones/clics duplicados que a veces reporta la captura del
-/// sistema operativo para una sola acción física real (ver
-/// `ionconnect_input::x11::X11Capture` para el porqué puede pasar en X11).
-/// Se resuelve acá, del lado de `core`, en vez de ajustar qué eventos
-/// selecciona cada backend de captura — más robusto porque no depende de
-/// la semántica fina de cada plataforma, y funciona igual sin importar de
-/// dónde venga la duplicación.
+/// Intervalo mínimo entre dos `MouseMove` mandados al mismo peer (~250 Hz).
+///
+/// Un mouse gamer reporta hasta 1000 posiciones por segundo, y reenviar cada
+/// una es contraproducente: satura el enlace justo cuando el `WiFi` anda mal
+/// (que es cuando más se nota), sin que el usuario pueda percibir la
+/// diferencia contra 250 Hz — muy por encima de los 60-144 Hz a los que
+/// refresca la pantalla del equipo remoto. Los reportes que caen dentro del
+/// intervalo no se tiran: se guardan como pendientes y se mandan en el
+/// próximo hueco, así la posición final de un movimiento siempre llega
+/// (ver [`SessionState::flush_pending_move`]).
+const MOUSE_SEND_INTERVAL: Duration = Duration::from_millis(4);
+
+/// Cada cuánto se comprueba si el peer que tiene el control sigue conectado.
+/// Antes se hacía en cada evento capturado — hasta 1000 veces por segundo
+/// para algo que solo cambia cuando alguien se desconecta.
+const PEER_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Plazo con el que se arma la rama de repetición del `select!` de Wayland
+/// cuando no hay ninguna tecla mantenida ni posición pendiente: lo bastante
+/// lejano como para no dispararse nunca en la práctica, y así no tener que
+/// construir el `select!` de dos formas distintas.
+const IDLE_WAKEUP: Duration = Duration::from_hours(1);
+
+/// Estado mutable de una sesión de captura: deduplicación, repetición de
+/// teclas y limitación de la tasa de `MouseMove`. Agrupado en un struct para
+/// no arrastrar media docena de parámetros sueltos por cada función del
+/// camino caliente.
+struct SessionState {
+    held: HeldGuard,
+    repeater: KeyRepeater,
+    /// Última posición que quedó sin mandar por el límite de tasa.
+    pending_move: Option<(DeviceId, i32, i32)>,
+    last_move_sent: Instant,
+    last_liveness_check: Instant,
+}
+
+impl SessionState {
+    fn new(settings: KeyRepeatSettings) -> Self {
+        // `Instant::now()` menos un intervalo: así el primer movimiento de
+        // la sesión sale enseguida en vez de esperar el primer hueco. Si el
+        // reloj monótono todavía no llegó a ese valor (arranque muy
+        // temprano de la máquina), `now` sirve igual: solo demora el primer
+        // envío unos milisegundos.
+        let now = Instant::now();
+        let past = now.checked_sub(MOUSE_SEND_INTERVAL).unwrap_or(now);
+        Self {
+            held: HeldGuard::default(),
+            repeater: KeyRepeater::new(settings.delay, settings.interval, move |keycode| {
+                settings.repeats(keycode)
+            }),
+            pending_move: None,
+            last_move_sent: past,
+            last_liveness_check: past,
+        }
+    }
+
+    /// Manda `(x, y)` al peer activo respetando [`MOUSE_SEND_INTERVAL`], o
+    /// lo deja pendiente para el próximo hueco.
+    fn send_move(
+        &mut self,
+        device: DeviceId,
+        x: i32,
+        y: i32,
+        routing: &Routing,
+        udp_peers: &UdpPeers,
+    ) {
+        let now = Instant::now();
+        if now.duration_since(self.last_move_sent) < MOUSE_SEND_INTERVAL {
+            self.pending_move = Some((device, x, y));
+            return;
+        }
+        self.pending_move = None;
+        self.last_move_sent = now;
+        send_mouse_move(device, x, y, routing, udp_peers);
+    }
+
+    /// Manda la posición que haya quedado pendiente si ya pasó el intervalo.
+    fn flush_pending_move(&mut self, routing: &Routing, udp_peers: &UdpPeers) {
+        let Some((device, x, y)) = self.pending_move else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(self.last_move_sent) < MOUSE_SEND_INTERVAL {
+            return;
+        }
+        self.pending_move = None;
+        self.last_move_sent = now;
+        send_mouse_move(device, x, y, routing, udp_peers);
+    }
+
+    /// Descarta el estado que solo tiene sentido mientras el control está
+    /// cedido a un remoto — llamar en cada cambio de dueño del control.
+    fn on_control_changed(&mut self) {
+        self.repeater.clear();
+        self.pending_move = None;
+    }
+
+    /// Cuánto se puede dormir esperando el próximo evento capturado antes de
+    /// tener trabajo propio que hacer (repetir una tecla o mandar la
+    /// posición pendiente). `None` = no hay nada agendado.
+    fn next_wakeup(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let repeat = self
+            .repeater
+            .next_deadline()
+            .map(|deadline| deadline.saturating_duration_since(now));
+        let pending = self.pending_move.map(|_| {
+            (self.last_move_sent + MOUSE_SEND_INTERVAL).saturating_duration_since(now)
+        });
+        match (repeat, pending) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (only, None) | (None, only) => only,
+        }
+    }
+}
+
+/// Manda un `MouseMove` continuo: por UDP si el peer ya se registró (tolera
+/// perderse, el próximo lo reemplaza — ver `core::udp_peers`), cayendo a la
+/// conexión TCP confiable si no.
+fn send_mouse_move(
+    device: DeviceId,
+    x: i32,
+    y: i32,
+    routing: &Routing,
+    udp_peers: &UdpPeers,
+) {
+    if !udp_peers.try_send_mouse_move(device, x, y) {
+        routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
+    }
+}
+
+/// Filtra pulsaciones/clics duplicados que la captura del sistema operativo
+/// pudiera reportar para una sola acción física real.
+///
+/// La duplicación que había en X11 ya no ocurre — venía de seleccionar los
+/// eventos crudos sobre "todos los dispositivos" en vez de solo los
+/// maestros, y se corrigió en el origen (ver
+/// `ionconnect_input::x11::X11Capture`). Esto queda como red de seguridad
+/// independiente de plataforma: no depende de la semántica fina de ningún
+/// backend, así que sigue cubriendo a Wayland y a cualquier backend futuro.
+///
+/// Ojo con las repeticiones de tecla: **no** llegan por acá. El sistema no
+/// las entrega por el camino crudo, se sintetizan aparte (ver
+/// `crate::key_repeat`), así que este filtro nunca las ve y no puede
+/// tragárselas por parecer "una pulsación repetida sin soltar".
 #[derive(Default)]
 struct HeldGuard {
     keys: std::collections::HashSet<u32>,
@@ -83,7 +222,13 @@ pub fn run_x11_input_session(
     let position = SharedPosition::new(0, 0);
     let mut capture = X11Capture::connect(position.clone())?;
     let control = X11Control::connect()?;
-    info!("captura de entrada X11 iniciada");
+    let repeat = control.key_repeat_settings();
+    info!(
+        delay_ms = repeat.delay.as_millis(),
+        interval_ms = repeat.interval.as_millis(),
+        enabled = repeat.enabled,
+        "captura de entrada X11 iniciada"
+    );
 
     let (tx, rx) = std_mpsc::channel();
     let capture_thread = std::thread::spawn(move || {
@@ -92,15 +237,78 @@ pub fn run_x11_input_session(
         }
     });
 
-    let mut held = HeldGuard::default();
-    while let Ok(event) = rx.recv() {
-        handle_captured_event(
-            event, handoff, &control, &position, routing, udp_peers, &mut held,
-        );
+    let mut session = SessionState::new(repeat);
+    loop {
+        // Esperar sin plazo mientras no haya nada agendado (el caso normal:
+        // ninguna tecla mantenida ni posición pendiente) mantiene este hilo
+        // completamente dormido en vez de despertándolo a sondear.
+        let event = match session.next_wakeup() {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(event) => Some(event),
+                Err(std_mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            },
+        };
+
+        if let Some(event) = event {
+            handle_captured_event(
+                event,
+                handoff,
+                &control,
+                &position,
+                routing,
+                udp_peers,
+                &mut session,
+            );
+        }
+        emit_due_key_repeats(handoff, routing, &position, &mut session);
+        session.flush_pending_move(routing, udp_peers);
     }
 
     let _ = capture_thread.join();
     Ok(())
+}
+
+/// Reenvía al equipo remoto activo las repeticiones de tecla que ya vencieron.
+///
+/// Estas repeticiones no vienen de la captura: el sistema operativo no las
+/// entrega por el camino crudo que usa este proyecto, así que se sintetizan
+/// acá (ver `crate::key_repeat` para el porqué y la medición). Si el control
+/// volvió a ser local, no hay a quién mandarlas y se corta la repetición en
+/// curso.
+fn emit_due_key_repeats(
+    handoff: &Arc<Mutex<HandoffState>>,
+    routing: &Routing,
+    position: &SharedPosition,
+    session: &mut SessionState,
+) {
+    if session.repeater.next_deadline().is_none() {
+        return;
+    }
+    let active = handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .active();
+    let Active::Remote(device) = active else {
+        session.repeater.clear();
+        return;
+    };
+    while let Some(keycode) = session.repeater.tick(Instant::now()) {
+        forward_button_or_key(
+            CapturedEvent::Key {
+                keycode,
+                modifiers: KeyModifiers::NONE,
+                pressed: true,
+            },
+            device,
+            position,
+            routing,
+        );
+    }
 }
 
 /// Cuántos reportes de posición saltear entre cada línea de log — a la
@@ -122,7 +330,14 @@ fn reclaim_if_peer_gone(
     control: &X11Control,
     position: &SharedPosition,
     routing: &Routing,
+    session: &mut SessionState,
 ) {
+    let now = Instant::now();
+    if now.duration_since(session.last_liveness_check) < PEER_LIVENESS_CHECK_INTERVAL {
+        return;
+    }
+    session.last_liveness_check = now;
+
     let device = match handoff
         .lock()
         .expect("el lock de handoff no debería estar envenenado")
@@ -143,6 +358,7 @@ fn reclaim_if_peer_gone(
         .expect("el lock de handoff no debería estar envenenado")
         .reclaim_if_remote(device);
     if reclaimed {
+        session.on_control_changed();
         let (x, y) = position.get();
         apply_handoff_action(
             HandoffAction::ReturnLocal { x, y },
@@ -163,22 +379,42 @@ fn handle_captured_event(
     position: &SharedPosition,
     routing: &Routing,
     udp_peers: &UdpPeers,
-    held: &mut HeldGuard,
+    session: &mut SessionState,
 ) {
-    reclaim_if_peer_gone(handoff, control, position, routing);
+    reclaim_if_peer_gone(handoff, control, position, routing, session);
     match event {
         CapturedEvent::AbsolutePosition { x, y } | CapturedEvent::MouseMove { x, y } => {
+            // A nivel `debug` a propósito: con el mouse en movimiento esto
+            // se dispara decenas de veces por segundo, y cada línea de log
+            // es un viaje a journald que compite con el camino caliente.
             if POSITION_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % POSITION_LOG_SAMPLE_RATE == 0
             {
-                info!(x, y, ?event, "posición de mouse capturada");
+                debug!(x, y, ?event, "posición de mouse capturada");
             }
-            handle_position_report(event, x, y, handoff, control, position, routing, udp_peers);
+            handle_position_report(event, x, y, handoff, control, position, routing, udp_peers, session);
         }
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. } => {
-            if !held.accept(&event) {
+            if !session.held.accept(&event) {
                 return;
             }
             info!(?event, "botón/tecla capturado");
+            // El estado de repetición se alimenta con la pulsación física
+            // aunque el control sea local: así, si el hand-off ocurre con
+            // una tecla ya mantenida, la repetición arranca con el mismo
+            // retardo que tendría localmente.
+            match event {
+                CapturedEvent::Key {
+                    keycode,
+                    pressed: true,
+                    ..
+                } => session.repeater.on_press(keycode, Instant::now()),
+                CapturedEvent::Key {
+                    keycode,
+                    pressed: false,
+                    ..
+                } => session.repeater.on_release(keycode),
+                _ => {}
+            }
             let active = handoff
                 .lock()
                 .expect("el lock de handoff no debería estar envenenado")
@@ -207,6 +443,7 @@ fn handle_position_report(
     position: &SharedPosition,
     routing: &Routing,
     udp_peers: &UdpPeers,
+    session: &mut SessionState,
 ) {
     let mut state = handoff
         .lock()
@@ -239,6 +476,9 @@ fn handle_position_report(
 
     if let Some(action) = state.on_position(x, y) {
         drop(state);
+        // Cambia el dueño del control: lo que quedara pendiente pertenece a
+        // la etapa anterior y ya no corresponde mandarlo.
+        session.on_control_changed();
         apply_handoff_action(action, handoff, control, position, routing, (x, y));
     } else if let Active::Remote(device) = state.active() {
         // Sin vecino enlazado en el borde que se acaba de cruzar (o
@@ -249,13 +489,9 @@ fn handle_position_report(
         drop(state);
         position.reset(x, y);
         // Delta continuo (no el primer `MouseMove` de un hand-off, que va
-        // por `apply_handoff_action` y siempre por TCP): tolera perderse,
-        // el próximo lo reemplaza — ver `core::udp_peers`. Si no hay peer
-        // UDP registrado (todavía no llegó su `UdpHello`, o no lo soporta),
-        // cae a la conexión confiable de siempre.
-        if !udp_peers.try_send_mouse_move(device, x, y) {
-            routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
-        }
+        // por `apply_handoff_action` y siempre por TCP): tolera perderse y
+        // se limita a [`MOUSE_SEND_INTERVAL`], el próximo lo reemplaza.
+        session.send_move(device, x, y, routing, udp_peers);
     }
 }
 
@@ -383,7 +619,11 @@ pub async fn run_wayland_input_session(
     let mut activated_stream = watcher.receive_activated().await?;
     let mut deactivated_stream = watcher.receive_deactivated().await?;
     let mut current_activation: Option<u32> = None;
-    let mut held = HeldGuard::default();
+    // El portal no expone el retardo/ritmo de repetición que tiene
+    // configurado el usuario (a diferencia de X11, ver
+    // `X11Control::key_repeat_settings`), así que acá se usan los valores
+    // estándar.
+    let mut session_state = SessionState::new(KeyRepeatSettings::default());
 
     // Red de seguridad para cuando el peer que tiene el control desaparece
     // (crash, se le mata el proceso, se corta la red) sin que eso dispare
@@ -396,6 +636,10 @@ pub async fn run_wayland_input_session(
     let mut watchdog = tokio::time::interval(Duration::from_secs(1));
 
     loop {
+        let repeat_deadline = session_state
+            .next_wakeup()
+            .unwrap_or(IDLE_WAKEUP);
+
         tokio::select! {
             _ = watchdog.tick() => {
                 reclaim_if_peer_gone_wayland(
@@ -406,6 +650,10 @@ pub async fn run_wayland_input_session(
                 )
                 .await;
             }
+            () = tokio::time::sleep(repeat_deadline) => {
+                emit_due_key_repeats_wayland(&handoff, &routing, &mut session_state);
+                session_state.flush_pending_move(&routing, &udp_peers);
+            }
             event = session.next_event(&mut activated_stream, &mut deactivated_stream) => {
                 let event = event?;
                 handle_wayland_event(
@@ -415,11 +663,41 @@ pub async fn run_wayland_input_session(
                     &routing,
                     &udp_peers,
                     &mut current_activation,
-                    &mut held,
+                    &mut session_state,
                 )
                 .await;
             }
         }
+    }
+}
+
+/// Igual que [`emit_due_key_repeats`] pero para la sesión Wayland: las
+/// repeticiones de teclado no llevan posición, así que no hace falta el
+/// [`SharedPosition`] que sí usa el camino X11.
+fn emit_due_key_repeats_wayland(
+    handoff: &Arc<Mutex<HandoffState>>,
+    routing: &Routing,
+    state: &mut SessionState,
+) {
+    if state.repeater.next_deadline().is_none() {
+        return;
+    }
+    let active = handoff
+        .lock()
+        .expect("el lock de handoff no debería estar envenenado")
+        .active();
+    let Active::Remote(device) = active else {
+        state.repeater.clear();
+        return;
+    };
+    while let Some(keycode) = state.repeater.tick(Instant::now()) {
+        routing.send_to(
+            device,
+            Message::KeyboardPress(KeyboardPress {
+                keycode,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
     }
 }
 
@@ -462,7 +740,7 @@ async fn handle_wayland_event(
     routing: &Routing,
     udp_peers: &UdpPeers,
     current_activation: &mut Option<u32>,
-    held: &mut HeldGuard,
+    state: &mut SessionState,
 ) {
     match event {
         WaylandCaptureEvent::Activated {
@@ -487,6 +765,7 @@ async fn handle_wayland_event(
             match action {
                 Some(HandoffAction::ForwardTo { device, x, y }) => {
                     info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
+                    state.on_control_changed();
                     session.reset_position(x, y);
                     if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
                         warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
@@ -513,7 +792,7 @@ async fn handle_wayland_event(
                 routing,
                 udp_peers,
                 current_activation,
-                held,
+                state,
             )
             .await;
         }
@@ -528,16 +807,32 @@ async fn handle_wayland_input(
     routing: &Routing,
     udp_peers: &UdpPeers,
     current_activation: &mut Option<u32>,
-    held: &mut HeldGuard,
+    state: &mut SessionState,
 ) {
     reclaim_if_peer_gone_wayland(handoff, routing, session, current_activation).await;
 
     if matches!(
         event,
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. }
-    ) && !held.accept(&event)
+    ) && !state.held.accept(&event)
     {
         return;
+    }
+
+    // Ver el comentario equivalente en `handle_captured_event` (X11): el
+    // estado de repetición se alimenta con la pulsación física.
+    match event {
+        CapturedEvent::Key {
+            keycode,
+            pressed: true,
+            ..
+        } => state.repeater.on_press(keycode, Instant::now()),
+        CapturedEvent::Key {
+            keycode,
+            pressed: false,
+            ..
+        } => state.repeater.on_release(keycode),
+        _ => {}
     }
 
     let active = handoff
@@ -550,9 +845,10 @@ async fn handle_wayland_input(
 
     match event {
         CapturedEvent::MouseMove { x, y } => {
+            // A nivel `debug`: ver el comentario equivalente en el camino X11.
             if POSITION_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % POSITION_LOG_SAMPLE_RATE == 0
             {
-                info!(x, y, "posición de mouse capturada (Wayland)");
+                debug!(x, y, "posición de mouse capturada (Wayland)");
             }
             let mut guard = handoff
                 .lock()
@@ -561,6 +857,7 @@ async fn handle_wayland_input(
             if let Some(HandoffAction::ReturnLocal { x, y }) = action {
                 drop(guard);
                 info!(x, y, "hand-off: recuperando control local");
+                state.on_control_changed();
                 let _ = session
                     .release(*current_activation, Some((f64::from(x), f64::from(y))))
                     .await;
@@ -573,11 +870,10 @@ async fn handle_wayland_input(
                 let (x, y) = guard.clamp_to_active_desktop(x, y);
                 drop(guard);
                 session.reset_position(x, y);
-                // Delta continuo — tolera perderse, ver el comentario
-                // equivalente en `handle_position_report` (X11).
-                if !udp_peers.try_send_mouse_move(device, x, y) {
-                    routing.send_to(device, Message::MouseMove(MouseMove { x, y }));
-                }
+                // Delta continuo — tolera perderse y va limitado a
+                // [`MOUSE_SEND_INTERVAL`], ver el comentario equivalente en
+                // `handle_position_report` (X11).
+                state.send_move(device, x, y, routing, udp_peers);
             }
         }
         CapturedEvent::MouseButton { button, pressed } => {

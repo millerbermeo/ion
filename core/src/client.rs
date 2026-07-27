@@ -17,6 +17,7 @@ use ionconnect_protocol::{
 use ionconnect_shared::{DeviceId, KeyModifiers};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 use tracing::{info, warn};
 
@@ -234,14 +235,48 @@ impl HeldInput {
     }
 }
 
-/// El sondeo de portapapeles vive en el mismo `select!` que la recepción de
-/// red (en vez de una tarea aparte) porque ambos necesitan `conn`/`clipboard`
-/// a la vez: una tarea separada obligaría a repartir el `Connection` entre
-/// dos dueños, y `Connection` no está pensado para eso.
+/// Cada cuánto se le pregunta al sistema si cambió el portapapeles local.
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Sondea el portapapeles local y entrega por `sink` cada cambio genuino.
 ///
+/// Corre en su propia tarea, y cada lectura va a un hilo bloqueante: leer el
+/// portapapeles es una llamada síncrona que habla con el servidor
+/// X/compositor y puede tardar cientos de milisegundos cuando la aplicación
+/// que lo posee está ocupada (justo el caso de "muchas cosas abiertas").
+/// Antes esto vivía dentro del mismo `select!` que la recepción de red, así
+/// que cada una de esas lecturas lentas congelaba también la inyección de
+/// mouse y teclado. Ahora el bucle de sesión solo recibe el resultado ya
+/// listo por un canal, y `Connection` sigue teniendo un único dueño.
+async fn poll_clipboard_changes(
+    clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    sink: mpsc::Sender<String>,
+) {
+    let mut ticker = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
+    loop {
+        ticker.tick().await;
+        let clipboard = clipboard.clone();
+        let polled =
+            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_once()).await;
+        match polled {
+            Ok(Ok(Some(text))) => {
+                if sink.send(text).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => warn!(%err, "error leyendo el portapapeles"),
+            Err(err) => {
+                warn!(%err, "la tarea de lectura del portapapeles terminó mal");
+                break;
+            }
+        }
+    }
+}
+
 /// Sea cual sea el motivo de salida (desconexión limpia o error de red vía
 /// `?`), libera cualquier tecla/botón que haya quedado a medio presionar —
-/// ver [`HeldInput`].
+/// ver [`HeldInput`] — y detiene el sondeo del portapapeles de esta sesión.
 async fn session_loop(
     conn: &mut ClientConnection,
     injector: &mut dyn InputInjector,
@@ -249,8 +284,24 @@ async fn session_loop(
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
 ) -> Result<(), CoreError> {
+    let (clipboard_tx, clipboard_rx) = mpsc::channel(4);
+    let poller = tokio::spawn(poll_clipboard_changes(clipboard.clone(), clipboard_tx));
+
     let mut held = HeldInput::default();
-    let result = session_loop_inner(conn, injector, clipboard, &mut held, udp_socket, udp_key).await;
+    let result = session_loop_inner(
+        conn,
+        injector,
+        clipboard,
+        &mut held,
+        udp_socket,
+        udp_key,
+        clipboard_rx,
+    )
+    .await;
+
+    // Cada reconexión arranca su propio sondeo: sin esto se acumularía uno
+    // por sesión, todos leyendo el mismo portapapeles.
+    poller.abort();
     held.release_all(injector);
     result
 }
@@ -263,8 +314,8 @@ async fn session_loop_inner(
     held: &mut HeldInput,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
+    mut clipboard_rx: mpsc::Receiver<String>,
 ) -> Result<(), CoreError> {
-    let mut clipboard_ticker = tokio::time::interval(Duration::from_millis(500));
     // `None` = todavía no se aceptó ningún `MouseMove` por UDP en esta
     // sesión — el primero siempre se acepta, después se exige que la
     // secuencia sea más nueva (ver `ionconnect_network::is_newer`).
@@ -323,19 +374,31 @@ async fn session_loop_inner(
                     Err(err) => warn!(%err, "error leyendo el socket UDP de MouseMove"),
                 }
             }
-            _ = clipboard_ticker.tick() => {
-                let changed = clipboard.lock().await.poll_once();
-                if let Ok(Some(text)) = changed {
-                    conn.send(Message::ClipboardSync(ClipboardSync {
-                        mime: ClipboardMime::Text,
-                        data: text.into_bytes(),
-                    })).await?;
-                }
+            // Cambio local del portapapeles ya detectado por la tarea de
+            // sondeo (ver `poll_clipboard_changes`) — acá solo queda
+            // mandarlo, que es barato.
+            Some(text) = clipboard_rx.recv() => {
+                conn.send(Message::ClipboardSync(ClipboardSync {
+                    mime: ClipboardMime::Text,
+                    data: text.into_bytes(),
+                })).await?;
             }
         }
     }
 }
 
+/// Elige con qué backend inyectar la entrada recibida.
+///
+/// En Linux se intentan **los dos** backends, empezando por el que
+/// corresponde al tipo de sesión: que `XDG_SESSION_TYPE` diga `wayland` no
+/// garantiza que el portal `RemoteDesktop` esté disponible (falta
+/// `xdg-desktop-portal`, el usuario rechaza el permiso, o el servicio corre
+/// sin bus de sesión accesible), y en una sesión Wayland casi siempre hay un
+/// `XWayland` al que XTEST sí puede llegar. Al revés vale lo mismo: un
+/// servicio de sistema con `XDG_SESSION_TYPE` sin definir no debería
+/// quedarse sin inyectar solo porque `DISPLAY` no estaba puesto. Sin esta
+/// cadena, un cliente Linux que fallara en su backend preferido terminaba el
+/// proceso en vez de conectarse igual.
 async fn create_injector() -> Result<Box<dyn InputInjector>, CoreError> {
     #[cfg(windows)]
     {
@@ -343,15 +406,40 @@ async fn create_injector() -> Result<Box<dyn InputInjector>, CoreError> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let is_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
-        if is_wayland {
-            let injector = ionconnect_input::wayland::WaylandPortalInjector::connect()
-                .await
-                .map_err(CoreError::Input)?;
-            return Ok(Box::new(injector));
-        }
-        let injector = ionconnect_input::x11::X11Injector::connect().map_err(CoreError::Input)?;
-        return Ok(Box::new(injector));
+        let prefers_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
+            || (std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && std::env::var_os("DISPLAY").is_none());
+
+        let (first, second) = if prefers_wayland {
+            (Backend::Wayland, Backend::X11)
+        } else {
+            (Backend::X11, Backend::Wayland)
+        };
+
+        let first_error = match connect_backend(first).await {
+            Ok(injector) => {
+                info!(backend = first.name(), "backend de inyección listo");
+                return Ok(injector);
+            }
+            Err(err) => err,
+        };
+        warn!(
+            backend = first.name(),
+            %first_error,
+            fallback = second.name(),
+            "el backend de inyección preferido no está disponible, probando el otro"
+        );
+        return match connect_backend(second).await {
+            Ok(injector) => {
+                info!(backend = second.name(), "backend de inyección listo");
+                Ok(injector)
+            }
+            Err(second_error) => Err(CoreError::Other(format!(
+                "ningún backend de inyección disponible en este equipo — {}: {first_error} / {}: {second_error}",
+                first.name(),
+                second.name()
+            ))),
+        };
     }
     #[allow(unreachable_code)]
     {
@@ -359,6 +447,36 @@ async fn create_injector() -> Result<Box<dyn InputInjector>, CoreError> {
         Err(CoreError::Other(
             "sistema operativo no soportado".to_string(),
         ))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy)]
+enum Backend {
+    X11,
+    Wayland,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Backend {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::X11 => "x11",
+            Self::Wayland => "wayland",
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn connect_backend(backend: Backend) -> Result<Box<dyn InputInjector>, CoreError> {
+    match backend {
+        Backend::X11 => ionconnect_input::x11::X11Injector::connect()
+            .map(|injector| Box::new(injector) as Box<dyn InputInjector>)
+            .map_err(CoreError::Input),
+        Backend::Wayland => ionconnect_input::wayland::WaylandPortalInjector::connect()
+            .await
+            .map(|injector| Box::new(injector) as Box<dyn InputInjector>)
+            .map_err(CoreError::Input),
     }
 }
 

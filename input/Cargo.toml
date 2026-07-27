@@ -17,7 +17,7 @@ tracing = "0.1.44"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 ashpd = { version = "0.13.12", default-features = false, features = ["tokio", "remote_desktop", "screencast", "input_capture"] }
-x11rb = { version = "0.13", features = ["xtest", "xinput"] }
+x11rb = { version = "0.13", features = ["xtest", "xinput", "xkb"] }
 reis = { version = "0.7.0", features = ["tokio"] }
 futures-util = "0.3"
 
