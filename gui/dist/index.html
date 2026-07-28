@@ -1,122 +1,262 @@
 <!doctype html>
-<html lang="es">
+<html lang="es" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>IonConnect</title>
     <link rel="stylesheet" href="styles.css" />
+    <!--
+      `main.js` va en el <head> y SIN `defer` a propósito: su primera línea
+      aplica el tema guardado, y al ser bloqueante eso ocurre antes del
+      primer paint (sin destello de tema equivocado). No se puede usar un
+      <script> inline porque la CSP de tauri.conf.json es
+      `default-src 'self'`, que no habilita 'unsafe-inline' para scripts.
+      La inicialización que depende del DOM sigue colgada de DOMContentLoaded.
+    -->
+    <script src="main.js"></script>
   </head>
   <body>
     <div class="app">
-      <header class="titlebar">
-        <span class="titlebar__name">IonConnect</span>
-        <button id="theme-toggle" class="icon-button" title="Cambiar tema" type="button">🌓</button>
+      <header class="topbar">
+        <div class="brand">
+          <svg
+            class="brand__mark"
+            width="18"
+            height="18"
+            viewBox="0 0 18 18"
+            fill="none"
+            aria-hidden="true"
+          >
+            <rect x="0.75" y="2.75" width="7" height="6" rx="1.25" stroke="currentColor" stroke-width="1.5" />
+            <rect x="10.25" y="9.25" width="7" height="6" rx="1.25" stroke="currentColor" stroke-width="1.5" />
+            <path d="M4.25 8.75v2.5a1.5 1.5 0 0 0 1.5 1.5h4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+          </svg>
+          <span>IonConnect</span>
+        </div>
+        <button
+          id="theme-toggle"
+          class="btn btn--ghost btn--icon btn--sm"
+          type="button"
+          title="Cambiar tema"
+          aria-label="Cambiar tema"
+        ></button>
       </header>
 
       <main class="content">
-        <section class="panel">
-          <h2>Este equipo</h2>
-          <label>
-            ID de este equipo (para configurarlo como peer en otra máquina)
-            <div class="device-id-row">
-              <input type="text" id="device-id" readonly />
-              <button id="copy-device-id" class="icon-button" type="button" title="Copiar">📋</button>
-            </div>
-          </label>
-
-          <div class="core-control">
-            <button id="core-toggle" type="button">Conectar</button>
-          </div>
-          <details class="core-log-details">
-            <summary>Ver actividad (ionconnect-core)</summary>
-            <pre id="core-log-view" class="core-log"></pre>
-          </details>
-
-          <h2>Equipos conectados</h2>
-          <ul id="device-list" class="device-list">
-            <li class="device-list__empty">Sin equipos conectados todavía.</li>
-          </ul>
-        </section>
-
-        <section class="panel">
-          <h2>Configuración</h2>
-          <form id="settings-form" class="settings-form">
-            <label>
-              Nombre de este equipo
-              <input type="text" id="device_name" name="device_name" required />
-            </label>
-            <label class="checkbox">
-              <input type="checkbox" id="discovery_enabled" name="discovery_enabled" />
-              Descubrimiento automático en la LAN (mDNS)
-            </label>
-            <label>
-              Emparejamiento
-              <select id="pairing_mode" name="pairing_mode">
-                <option value="reject-unknown">Rechazar equipos desconocidos</option>
-                <option value="auto-trust-on-first-use">Confiar automáticamente (solo primer uso)</option>
-              </select>
-            </label>
-            <label>
-              Nivel de log
-              <select id="log_level" name="log_level">
-                <option value="error">error</option>
-                <option value="warn">warn</option>
-                <option value="info">info</option>
-                <option value="debug">debug</option>
-                <option value="trace">trace</option>
-              </select>
-            </label>
-
-            <label>
-              Rol de este equipo
-              <select id="role" name="role">
-                <option value="server">Servidor (tiene el mouse/teclado físico)</option>
-                <option value="client">Cliente (recibe el control de un servidor)</option>
-              </select>
-            </label>
-
-            <div id="client-fields" class="role-fields" hidden>
-              <label>
-                Dirección del servidor (host:puerto)
-                <input type="text" id="server_address" name="server_address" placeholder="192.168.1.10:44890" />
-              </label>
-            </div>
-
-            <div id="server-fields" class="role-fields" hidden>
-              <label>
-                Puerto de escucha
-                <input type="number" id="listen_port" name="listen_port" min="1" max="65535" required />
-              </label>
+        <!-- ============ Columna izquierda: estado en vivo ============ -->
+        <div class="content__col">
+          <section class="panel">
+            <div class="panel__head">
+              <h2 class="panel__title">Este equipo</h2>
               <p class="hint">
-                Un equipo por cada lado de esta pantalla a la que el mouse pueda "salir".
-                Pegá acá el ID que la GUI de esa otra máquina muestra en "Este equipo".
+                Pegá este identificador en la otra máquina para agregarla como equipo vecino.
               </p>
-              <table class="peers-table">
-                <thead>
-                  <tr>
-                    <th>Nombre</th>
-                    <th>ID del equipo</th>
-                    <th>Lado de esta pantalla</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody id="peers-body"></tbody>
-              </table>
-              <button type="button" id="add-peer">+ Agregar equipo</button>
             </div>
 
-            <button type="submit">Guardar</button>
-            <span id="save-status" class="save-status" role="status"></span>
-          </form>
-        </section>
+            <div class="field" style="max-width: none">
+              <span class="field__label" id="device-id-label">Identificador</span>
+              <div class="id-row">
+                <input
+                  type="text"
+                  id="device-id"
+                  class="input"
+                  readonly
+                  aria-labelledby="device-id-label"
+                />
+                <button
+                  id="copy-device-id"
+                  class="btn btn--secondary btn--icon"
+                  type="button"
+                  title="Copiar identificador"
+                  aria-label="Copiar identificador"
+                ></button>
+              </div>
+            </div>
+
+            <div class="divider"></div>
+
+            <button id="core-toggle" class="btn btn--primary" type="button">Conectar</button>
+
+            <details class="log">
+              <summary class="log__summary">Ver actividad del servicio</summary>
+              <pre id="core-log-view" class="log__output"></pre>
+            </details>
+          </section>
+
+          <section class="panel">
+            <div class="panel__head">
+              <h2 class="panel__title">Equipos conectados</h2>
+            </div>
+            <ul id="device-list" class="device-list"></ul>
+          </section>
+        </div>
+
+        <!-- ============ Columna derecha: configuración ============ -->
+        <div class="content__col">
+          <section class="panel">
+            <div class="panel__head">
+              <h2 class="panel__title">Configuración</h2>
+            </div>
+
+            <form id="settings-form" class="form">
+              <div class="field">
+                <label class="field__label" for="device_name">Nombre de este equipo</label>
+                <input
+                  type="text"
+                  id="device_name"
+                  name="device_name"
+                  class="input"
+                  required
+                />
+              </div>
+
+              <div class="field">
+                <label class="field__label" for="role">Rol de este equipo</label>
+                <span class="select-wrap">
+                  <select id="role" name="role" class="select">
+                    <option value="server">Servidor — tiene el mouse y el teclado</option>
+                    <option value="client">Cliente — recibe el control</option>
+                  </select>
+                </span>
+              </div>
+
+              <!-- Campos exclusivos del rol cliente -->
+              <div id="client-fields" class="field" hidden>
+                <label class="field__label" for="server_address">Dirección del servidor</label>
+                <input
+                  type="text"
+                  id="server_address"
+                  name="server_address"
+                  class="input mono"
+                  placeholder="192.168.1.10:44890"
+                />
+                <span class="field__hint">
+                  Dejalo vacío para buscar el servidor automáticamente en la red local.
+                </span>
+              </div>
+
+              <!-- Campos exclusivos del rol servidor -->
+              <div id="server-fields" hidden>
+                <div class="field">
+                  <label class="field__label" for="listen_port">Puerto de escucha</label>
+                  <input
+                    type="number"
+                    id="listen_port"
+                    name="listen_port"
+                    class="input"
+                    min="1"
+                    max="65535"
+                  />
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="panel__head" style="margin-bottom: var(--s-3)">
+                  <h3 class="eyebrow">Disposición de pantallas</h3>
+                  <p class="hint">
+                    Elegí de qué lado de esta pantalla queda cada equipo. Tocá un borde libre
+                    para agregar uno.
+                  </p>
+                </div>
+
+                <div
+                  id="screen-map"
+                  class="screen-map"
+                  role="group"
+                  aria-label="Disposición de pantallas vecinas"
+                >
+                  <button
+                    type="button"
+                    class="screen-map__zone screen-map__zone--top"
+                    data-edge="top"
+                  ></button>
+                  <button
+                    type="button"
+                    class="screen-map__zone screen-map__zone--left"
+                    data-edge="left"
+                  ></button>
+                  <div class="screen-map__screen">
+                    <span class="screen-map__screen-eyebrow">Esta pantalla</span>
+                    <span class="screen-map__screen-name" id="screen-map-name">—</span>
+                  </div>
+                  <button
+                    type="button"
+                    class="screen-map__zone screen-map__zone--right"
+                    data-edge="right"
+                  ></button>
+                  <button
+                    type="button"
+                    class="screen-map__zone screen-map__zone--bottom"
+                    data-edge="bottom"
+                  ></button>
+                </div>
+
+                <div id="peers-body" class="peer-list" style="margin-top: var(--s-3)"></div>
+
+                <button id="add-peer" class="btn btn--secondary btn--sm" type="button" style="margin-top: var(--s-3)">
+                  Agregar equipo
+                </button>
+              </div>
+
+              <div class="divider"></div>
+
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  id="discovery_enabled"
+                  name="discovery_enabled"
+                  class="switch__input"
+                />
+                <span class="switch__track"></span>
+                <span class="switch__text">Descubrimiento automático en la red local (mDNS)</span>
+              </label>
+
+              <div class="field">
+                <label class="field__label" for="pairing_mode">Emparejamiento</label>
+                <span class="select-wrap">
+                  <select id="pairing_mode" name="pairing_mode" class="select">
+                    <option value="reject-unknown">Rechazar equipos desconocidos</option>
+                    <option value="auto-trust-on-first-use">
+                      Confiar en el primer equipo que se conecte
+                    </option>
+                  </select>
+                </span>
+              </div>
+
+              <div class="field">
+                <label class="field__label" for="log_level">Nivel de registro</label>
+                <span class="select-wrap">
+                  <select id="log_level" name="log_level" class="select">
+                    <option value="error">error</option>
+                    <option value="warn">warn</option>
+                    <option value="info">info</option>
+                    <option value="debug">debug</option>
+                    <option value="trace">trace</option>
+                  </select>
+                </span>
+              </div>
+
+              <div class="divider"></div>
+
+              <button class="btn btn--primary" type="submit" style="align-self: flex-start">
+                Guardar cambios
+              </button>
+            </form>
+          </section>
+        </div>
       </main>
 
       <footer class="statusbar">
-        <span id="connection-indicator" class="status status--offline">● sin conexiones</span>
-        <span id="latency-indicator" class="status">latencia: —</span>
+        <span id="connection-indicator" class="status status--offline" aria-live="polite"
+          >Sin conexiones</span
+        >
+        <span class="statusbar__spacer"></span>
+        <span id="peer-count-indicator">Sin equipos</span>
+        <span class="statusbar__version">v0.1.0</span>
       </footer>
     </div>
 
-    <script src="main.js"></script>
+    <!-- Fuera del <form> para que pueda posicionarse fijo sobre toda la ventana. -->
+    <div id="save-status" class="toast" role="status" aria-live="polite"></div>
   </body>
 </html>

@@ -1,104 +1,725 @@
-:root {
-  color-scheme: light dark;
-  --bg: #f5f6f8;
-  --bg-elevated: #ffffff;
-  --text: #1a1d21;
-  --text-muted: #6b7280;
-  --border: #e2e4e8;
-  --accent: #2563eb;
-  --accent-contrast: #ffffff;
-  --danger: #dc2626;
-  --success: #16a34a;
-}
+/* ==========================================================================
+   IonConnect — hoja de estilos única
+   --------------------------------------------------------------------------
+   Orden: tokens → reset → shell → tipografía → controles → componentes →
+   utilidades → estados globales.
 
+   Dos restricciones de la CSP (`tauri.conf.json`) condicionan el diseño:
+     - `default-src 'self'` cubre `img-src`, así que **no hay `data:` URIs**.
+       Los chevrons, checks y flechas se dibujan con bordes CSS rotados, o
+       se insertan como `<svg>` inline (elemento del documento, no recurso).
+     - No hay fuentes remotas ni CDNs: todo con stacks del sistema.
+   ========================================================================== */
+
+/* ==========================================================================
+   1. TOKENS
+   El tema por defecto del producto es OSCURO — no seguimos
+   `prefers-color-scheme`. `main.js` fija `data-theme` antes del primer
+   paint; el `data-theme="dark"` del `<html>` es la red de seguridad si el
+   script no llegara a correr.
+   ========================================================================== */
+
+:root,
 :root[data-theme="dark"] {
-  --bg: #15171a;
-  --bg-elevated: #1e2126;
-  --text: #e8eaed;
-  --text-muted: #9aa1ab;
-  --border: #2b2f36;
-  --accent: #5b8def;
-  --accent-contrast: #0b0d10;
+  /* `color-scheme` por tema es lo que arregla los widgets nativos
+     (select, spinners del number, scrollbars). Sin esto, el modo claro
+     sobre un SO oscuro renderiza texto oscuro sobre fondo oscuro. */
+  color-scheme: dark;
+
+  --bg: #0e1116;
+  --surface: #151a21;
+  --surface-2: #1b212a;
+  --surface-hover: #212936;
+
+  /* `--border` es para contenedores (paneles, tarjetas, divisores): es
+     decorativo y se mantiene discreto a propósito. `--border-strong` es el
+     borde de los *controles*, y cumple el 3:1 de WCAG 1.4.11 — un input no
+     se distingue de su panel solo por el relleno, así que su contorno es lo
+     que lo identifica como control. */
+  --border: #262e39;
+  --border-strong: #5b6d84;
+
+  --text: #e6eaf0;
+  --text-muted: #9aa5b4;
+  --text-faint: #7f8999;
+
+  --accent: #5f80ff;
+  --accent-hover: #7290ff;
+  --accent-soft: rgba(95, 128, 255, 0.14);
+  --accent-ink: #0b0f18;
+
+  --success: #3fd68c;
+  --success-soft: rgba(63, 214, 140, 0.14);
+  --warning: #f5b44c;
+  --warning-soft: rgba(245, 180, 76, 0.14);
+  --danger: #f4685e;
+  --danger-soft: rgba(244, 104, 94, 0.14);
+
+  /* En oscuro la elevación se comunica con borde, no con sombra. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 12px 32px rgba(0, 0, 0, 0.55);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #15171a;
-    --bg-elevated: #1e2126;
-    --text: #e8eaed;
-    --text-muted: #9aa1ab;
-    --border: #2b2f36;
-    --accent: #5b8def;
-    --accent-contrast: #0b0d10;
-  }
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --surface-2: #fafbfc;
+  --surface-hover: #f0f3f7;
+  --border: #e3e7ed;
+  --border-strong: #7f92aa;
+
+  --text: #121820;
+  --text-muted: #5a6472;
+  --text-faint: #6a7586;
+
+  --accent: #3a5ce0;
+  --accent-hover: #2f4dc4;
+  --accent-soft: rgba(58, 92, 224, 0.1);
+  --accent-ink: #ffffff;
+
+  --success: #0f844c;
+  --success-soft: rgba(15, 132, 76, 0.1);
+  --warning: #a0680e;
+  --warning-soft: rgba(160, 104, 14, 0.1);
+  --danger: #cf4036;
+  --danger-soft: rgba(207, 64, 54, 0.1);
+
+  /* En claro, sombras de una sola capa y muy suaves. */
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-2: 0 4px 12px rgba(16, 24, 40, 0.08);
+  --shadow-3: 0 12px 32px rgba(16, 24, 40, 0.14);
 }
 
-* {
+:root {
+  /* Espaciado — escala de 4px */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-14: 56px;
+
+  /* Radios */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  /* Movimiento */
+  --t-fast: 120ms;
+  --t: 180ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Tipografía */
+  --font: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-20: 20px;
+  --fs-26: 26px;
+
+  /* Altura común de controles: botones, inputs y selects comparten métrica */
+  --control-h: 34px;
+  --control-h-sm: 28px;
+
+  /* Ancho máximo de un campo de formulario, para que no se estire a todo
+     el panel en ventanas anchas. */
+  --field-max: 480px;
+}
+
+/* ==========================================================================
+   2. RESET Y BASE
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+}
+
+/* Los contenedores usan flex/grid, así que el `display:none` del UA para
+   `[hidden]` necesita ganar explícitamente. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
   margin: 0;
-  font-family: -apple-system, "Segoe UI", Ubuntu, sans-serif;
+  font-family: var(--font);
+  font-size: var(--fs-14);
+  line-height: 1.5;
   background: var(--bg);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* Foco visible en todo control interactivo. Nunca `outline:none` sin
+   reemplazo — el anillo va separado del borde para que se lea sobre
+   cualquier superficie. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   3. SHELL: header, contenido, barra de estado
+   `height` fijo (no `min-height`) + scroll interno en `.content` es lo que
+   mantiene la barra de estado siempre pegada abajo en vez de empujada
+   fuera del viewport cuando el contenido crece.
+   ========================================================================== */
 
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
 }
 
-.titlebar {
+.topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.75rem 1rem;
+  gap: var(--s-4);
+  flex: 0 0 auto;
+  padding: 0 var(--s-4);
+  height: 48px;
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
-  background: var(--bg-elevated);
 }
 
-.titlebar__name {
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--fs-13);
   font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
-.icon-button {
-  background: none;
-  border: none;
-  font-size: 1.1rem;
-  cursor: pointer;
-  color: var(--text);
+.brand__mark {
+  display: block;
+  color: var(--accent);
 }
 
 .content {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0; /* permite que el hijo scrollee en vez de desbordar */
+  overflow-y: auto;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  padding: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--s-4);
+  padding: var(--s-4);
 }
 
-@media (max-width: 640px) {
+.content__col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
   .content {
     grid-template-columns: 1fr;
   }
 }
 
-.panel {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 0.5rem;
-  padding: 1rem;
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 var(--s-4);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: var(--fs-11);
+  color: var(--text-muted);
 }
 
-.panel h2 {
-  margin-top: 0;
-  font-size: 1rem;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+.statusbar__spacer {
+  flex: 1;
 }
+
+.statusbar__version {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  color: var(--text-faint);
+}
+
+/* ==========================================================================
+   4. TIPOGRAFÍA
+   ========================================================================== */
+
+/* Título de sección: el "eyebrow" en versalitas espaciadas. */
+.eyebrow {
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.panel__title {
+  font-size: var(--fs-14);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.hint {
+  font-size: var(--fs-12);
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   5. PANELES
+   ========================================================================== */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--s-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+}
+
+.panel__head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.panel__head--row {
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+
+/* Separador entre bloques dentro de un mismo panel. */
+.divider {
+  height: 1px;
+  background: var(--border);
+  margin: var(--s-1) 0;
+}
+
+/* ==========================================================================
+   6. CONTROLES DE FORMULARIO
+   ========================================================================== */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-4);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  max-width: var(--field-max);
+}
+
+.field__label {
+  font-size: var(--fs-12);
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.field__hint {
+  font-size: var(--fs-11);
+  color: var(--text-faint);
+}
+
+.input,
+.select {
+  height: var(--control-h);
+  width: 100%;
+  padding: 0 var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: var(--fs-13);
+  transition: border-color var(--t-fast) var(--ease),
+    background-color var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease);
+}
+
+.input::placeholder {
+  color: var(--text-faint);
+}
+
+.input:hover:not(:disabled),
+.select:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+.input:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* El anillo de `:focus-visible` sería redundante con el `box-shadow` de
+   arriba, que ya marca el foco con más contraste. */
+.input:focus-visible,
+.select:focus-visible {
+  outline: none;
+}
+
+.input:disabled,
+.select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Número: se ocultan los spinners nativos, que no se pueden estilar de
+   forma consistente entre temas ni entre WebKitGTK y WebView2. */
+.input[type="number"] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.input[type="number"]::-webkit-outer-spin-button,
+.input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Select: se quita la flecha nativa y se dibuja un chevron con bordes
+   rotados (la CSP prohíbe `data:` URIs, ver cabecera). */
+.select-wrap {
+  position: relative;
+  display: block;
+  width: 100%;
+}
+
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: var(--s-8);
+}
+
+.select-wrap::after {
+  content: "";
+  position: absolute;
+  right: var(--s-3);
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -4px;
+  border-right: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+  transform: rotate(45deg);
+  pointer-events: none;
+  transition: border-color var(--t-fast) var(--ease);
+}
+
+.select-wrap:hover::after {
+  border-color: var(--text);
+}
+
+/* `option` necesita color explícito: algunos WebView pintan el popup con
+   el fondo del sistema y no hereda del `select`. */
+.select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* --- Switch (reemplaza el checkbox nativo de mDNS) --- */
+
+.switch {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  cursor: pointer;
+  max-width: var(--field-max);
+}
+
+.switch__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch__track {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 20px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  transition: background-color var(--t) var(--ease),
+    border-color var(--t) var(--ease);
+}
+
+.switch__track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform var(--t) var(--ease), background-color var(--t) var(--ease);
+}
+
+.switch__input:checked + .switch__track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.switch__input:checked + .switch__track::after {
+  transform: translateX(14px);
+  background: var(--accent-ink);
+}
+
+.switch__input:focus-visible + .switch__track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.switch__text {
+  font-size: var(--fs-13);
+  color: var(--text);
+}
+
+/* ==========================================================================
+   7. BOTONES
+   ========================================================================== */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: var(--control-h);
+  padding: 0 var(--s-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-13);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    opacity var(--t-fast) var(--ease);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn--sm {
+  height: var(--control-h-sm);
+  padding: 0 var(--s-3);
+  font-size: var(--fs-12);
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn--secondary {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.btn--secondary:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.btn--ghost {
+  color: var(--text-muted);
+}
+
+.btn--ghost:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.btn--danger {
+  color: var(--text-faint);
+}
+
+.btn--danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Botón de solo icono: cuadrado, sin padding lateral. */
+.btn--icon {
+  width: var(--control-h);
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.btn--icon.btn--sm {
+  width: var(--control-h-sm);
+}
+
+.btn svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* ==========================================================================
+   8. CAMPO DEL ID DE ESTE EQUIPO
+   Readonly con estilo intencional: es un dato para copiar, no un campo
+   deshabilitado — por eso no se atenúa.
+   ========================================================================== */
+
+.id-row {
+  display: flex;
+  gap: var(--s-2);
+  max-width: none;
+}
+
+.id-row .input {
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  letter-spacing: 0.02em;
+  user-select: all;
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.id-row .input:read-only {
+  opacity: 1;
+}
+
+/* Estado "copiado" del botón. */
+.btn--copied {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+/* ==========================================================================
+   9. PILLS DE ESTADO
+   ========================================================================== */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 2px var(--s-2);
+  border-radius: var(--r-pill);
+  font-size: var(--fs-12);
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.status--online {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.status--connecting {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.status--connecting::before {
+  animation: pulse 1.8s var(--ease) infinite;
+}
+
+.status--offline {
+  color: var(--text-muted);
+  background: var(--surface-hover);
+}
+
+.status--error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* En la barra de estado la pill va sin fondo, solo el punto y el texto. */
+.statusbar .status {
+  background: transparent;
+  padding: 0;
+}
+
+/* ==========================================================================
+   10. LISTA DE EQUIPOS CONECTADOS
+   ========================================================================== */
 
 .device-list {
   list-style: none;
@@ -106,223 +727,499 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--s-2);
 }
 
-.device-list__empty {
-  color: var(--text-muted);
-  font-style: italic;
-}
-
-.settings-form {
+.device {
   display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.settings-form label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.85rem;
-  color: var(--text-muted);
-}
-
-.settings-form label.checkbox {
-  flex-direction: row;
   align-items: center;
-  gap: 0.5rem;
-}
-
-.settings-form input,
-.settings-form select {
-  padding: 0.4rem 0.5rem;
-  border-radius: 0.35rem;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  background: var(--surface-2);
   border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-  font-size: 0.95rem;
+  border-radius: var(--r-md);
+  transition: background-color var(--t-fast) var(--ease);
 }
 
-.settings-form button {
-  align-self: flex-start;
-  padding: 0.5rem 1rem;
-  border-radius: 0.35rem;
-  border: none;
-  background: var(--accent);
-  color: var(--accent-contrast);
+.device:hover {
+  background: var(--surface-hover);
+}
+
+.device__avatar {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-13);
   font-weight: 600;
-  cursor: pointer;
+  text-transform: uppercase;
 }
 
-.save-status {
-  position: fixed;
-  bottom: 1.5rem;
-  right: 1.5rem;
+.device__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.device__name {
+  font-size: var(--fs-14);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device__meta {
+  font-size: var(--fs-12);
+  color: var(--text-muted);
+}
+
+/* ==========================================================================
+   11. ESTADOS VACÍOS
+   ========================================================================== */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-6) var(--s-4);
+  text-align: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-md);
+  color: var(--text-muted);
+}
+
+.empty__icon {
+  color: var(--text-faint);
+}
+
+.empty__title {
+  font-size: var(--fs-13);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.empty__hint {
+  font-size: var(--fs-12);
+  color: var(--text-muted);
+  max-width: 34ch;
+}
+
+/* ==========================================================================
+   12. MAPA DE PANTALLA
+   Rectángulo = la pantalla de este equipo. Las cuatro zonas de borde son
+   botones: vacías invitan a crear un peer en ese lado, ocupadas enfocan la
+   tarjeta correspondiente.
+   ========================================================================== */
+
+.screen-map {
+  display: grid;
+  grid-template-areas:
+    ".    top    ."
+    "left screen right"
+    ".    bottom .";
+  grid-template-columns: minmax(64px, 1fr) minmax(0, 2.1fr) minmax(64px, 1fr);
+  gap: var(--s-2);
+  padding: var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.screen-map__zone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 46px;
+  padding: var(--s-2);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  font-size: var(--fs-11);
+  cursor: pointer;
+  overflow: hidden;
+  transition: background-color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.screen-map__zone:hover {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.screen-map__zone--top {
+  grid-area: top;
+}
+.screen-map__zone--right {
+  grid-area: right;
+}
+.screen-map__zone--bottom {
+  grid-area: bottom;
+}
+.screen-map__zone--left {
+  grid-area: left;
+}
+
+/* Zona ocupada: borde sólido y tinte de acento — deja de ser una
+   invitación a crear y pasa a ser un elemento del layout. */
+.screen-map__zone--filled {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.screen-map__peer {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-12);
+  font-weight: 500;
+}
+
+.screen-map__edge-label {
+  font-size: var(--fs-11);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.8;
+}
+
+/* El centro representa esta máquina: no es interactivo. */
+.screen-map__screen {
+  grid-area: screen;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 76px;
+  padding: var(--s-3);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+}
+
+.screen-map__screen-eyebrow {
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.screen-map__screen-name {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   13. TARJETAS DE PEER (configuración del servidor)
+   ========================================================================== */
+
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.peer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  transition: border-color var(--t-fast) var(--ease);
+}
+
+.peer:focus-within {
+  border-color: var(--border-strong);
+}
+
+.peer__row {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1.1rem;
-  border-radius: 0.6rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--accent-contrast);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  opacity: 0;
-  transform: translateY(0.5rem);
-  pointer-events: none;
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 1000;
+  gap: var(--s-2);
 }
 
-.save-status--visible {
+.peer__row .input {
+  height: var(--control-h-sm);
+  font-size: var(--fs-12);
+}
+
+.peer__name {
+  flex: 1 1 40%;
+  min-width: 0;
+}
+
+.peer__id {
+  flex: 1 1 60%;
+  min-width: 0;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+}
+
+.peer__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+
+.peer__edge-label {
+  font-size: var(--fs-11);
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+/* --- Selector de lado: control segmentado sobre radios nativos ---
+   Se usan `input[type=radio]` reales (no `role=radio`) para heredar del
+   navegador la navegación con flechas y la semántica de grupo. */
+
+.edge-picker {
+  display: flex;
+  flex: 1;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+}
+
+.edge-picker__opt {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  border-radius: 4px;
+  font-size: var(--fs-11);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+
+.edge-picker__opt:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.edge-picker__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.edge-picker__input:checked + .edge-picker__face {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.edge-picker__input:focus-visible + .edge-picker__face {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.edge-picker__face {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 4px;
+  transition: background-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+
+/* ==========================================================================
+   14. ACORDEÓN DE ACTIVIDAD (log de core)
+   ========================================================================== */
+
+.log {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.log__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  font-size: var(--fs-12);
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease);
+}
+
+.log__summary:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* Se oculta el marcador nativo (varía entre WebKit y Chromium) y se dibuja
+   un triángulo propio que rota al abrir. */
+.log__summary::-webkit-details-marker {
+  display: none;
+}
+
+.log__summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--t) var(--ease);
+}
+
+.log[open] .log__summary::before {
+  transform: rotate(45deg);
+}
+
+.log__output {
+  margin: 0;
+  padding: var(--s-3);
+  max-height: 180px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  line-height: 1.6;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log__output:empty::after {
+  content: "Sin actividad todavía. Iniciá el servicio para ver los registros.";
+  color: var(--text-faint);
+}
+
+/* ==========================================================================
+   15. TOAST
+   ========================================================================== */
+
+.toast {
+  position: fixed;
+  right: var(--s-4);
+  /* La barra de estado mide 28px: el toast se apoya por encima de ella. */
+  bottom: calc(28px + var(--s-3));
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  max-width: 380px;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
+  font-size: var(--fs-13);
+  font-weight: 500;
+  color: var(--text);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity var(--t) var(--ease), transform var(--t) var(--ease);
+}
+
+.toast--visible {
   opacity: 1;
   transform: translateY(0);
 }
 
-.save-status--success {
-  background: var(--success);
+.toast__icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
 }
 
-.save-status--error {
-  background: var(--danger);
+.toast--success {
+  border-color: var(--success);
 }
 
-.device-id-row {
-  display: flex;
-  gap: 0.4rem;
-}
-
-.device-id-row input {
-  flex: 1;
-  font-family: ui-monospace, monospace;
-  padding: 0.4rem 0.5rem;
-  border-radius: 0.35rem;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-}
-
-.role-fields {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  border: 1px dashed var(--border);
-  border-radius: 0.35rem;
-}
-
-.role-fields[hidden] {
-  display: none;
-}
-
-.role-fields .hint {
-  margin: 0;
-  font-size: 0.8rem;
-  color: var(--text-muted);
-}
-
-.peers-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-}
-
-.peers-table th {
-  text-align: left;
-  color: var(--text-muted);
-  font-weight: 500;
-  padding: 0.25rem 0.4rem;
-}
-
-.peers-table td {
-  padding: 0.25rem 0.4rem;
-}
-
-.peers-table input,
-.peers-table select {
-  width: 100%;
-  padding: 0.3rem 0.4rem;
-  border-radius: 0.3rem;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text);
-}
-
-#add-peer {
-  align-self: flex-start;
-  padding: 0.35rem 0.75rem;
-  border-radius: 0.35rem;
-  border: 1px solid var(--border);
-  background: var(--bg-elevated);
-  color: var(--text);
-  cursor: pointer;
-}
-
-.statusbar {
-  display: flex;
-  gap: 1rem;
-  padding: 0.5rem 1rem;
-  border-top: 1px solid var(--border);
-  background: var(--bg-elevated);
-  font-size: 0.8rem;
-  color: var(--text-muted);
-}
-
-.status--offline {
-  color: var(--danger);
-}
-
-.status--online {
+.toast--success .toast__icon {
   color: var(--success);
 }
 
-.status--connecting {
-  color: var(--warning, #d97706);
+.toast--error {
+  border-color: var(--danger);
 }
 
-.status--error {
+.toast--error .toast__icon {
   color: var(--danger);
 }
 
-.core-control {
-  margin: 0.5rem 0 1rem;
+/* ==========================================================================
+   16. SCROLLBARS
+   ========================================================================== */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 
-#core-toggle {
-  padding: 0.5rem 1rem;
-  border-radius: 0.35rem;
-  border: none;
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font-weight: 600;
-  cursor: pointer;
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
 }
 
-#core-toggle:disabled {
-  opacity: 0.6;
-  cursor: default;
+::-webkit-scrollbar-track {
+  background: transparent;
 }
 
-.core-log-details {
-  margin-bottom: 1rem;
-  font-size: 0.8rem;
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--r-pill);
 }
 
-.core-log-details summary {
-  cursor: pointer;
-  color: var(--text-muted);
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: padding-box;
 }
 
-.core-log {
-  margin: 0.5rem 0 0;
-  max-height: 180px;
-  overflow-y: auto;
-  padding: 0.5rem;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 0.35rem;
-  font-family: ui-monospace, monospace;
-  font-size: 0.75rem;
-  white-space: pre-wrap;
+/* ==========================================================================
+   17. MOVIMIENTO REDUCIDO
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
