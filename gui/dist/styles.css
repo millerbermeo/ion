@@ -133,10 +133,6 @@
   /* Altura común de controles: botones, inputs y selects comparten métrica */
   --control-h: 34px;
   --control-h-sm: 28px;
-
-  /* Ancho máximo de un campo de formulario, para que no se estire a todo
-     el panel en ventanas anchas. */
-  --field-max: 480px;
 }
 
 /* ==========================================================================
@@ -358,7 +354,6 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: var(--s-2);
-  max-width: var(--field-max);
 }
 
 .field__label {
@@ -478,7 +473,6 @@ textarea {
   align-items: center;
   gap: var(--s-3);
   cursor: pointer;
-  max-width: var(--field-max);
 }
 
 .switch__input {
@@ -630,7 +624,6 @@ textarea {
 .id-row {
   display: flex;
   gap: var(--s-2);
-  max-width: none;
 }
 
 .id-row .input {
