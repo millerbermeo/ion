@@ -56,10 +56,23 @@ install -m 755 "$INSTALL_DIR/target/release/ionconnect-gui" "$BIN_DIR/ionconnect
 install -m 755 "$INSTALL_DIR/target/release/ionconnect-core" "$BIN_DIR/ionconnect-core"
 
 log "Creando acceso directo (menú de aplicaciones)..."
-ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+ICONS_SRC="$INSTALL_DIR/gui/src-tauri/icons"
+ICON_ROOT="$HOME/.local/share/icons/hicolor"
 DESKTOP_DIR="$HOME/.local/share/applications"
-mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
-install -m 644 "$INSTALL_DIR/gui/src-tauri/icons/icon.png" "$ICON_DIR/ionconnect.png"
+mkdir -p "$DESKTOP_DIR"
+# Cada PNG va en el directorio de su tamaño real: si se instala uno de
+# 512px dentro de `256x256/`, el tema de iconos lo escala y se ve borroso.
+install_icon() {
+  local src="$1" size="$2"
+  [ -f "$src" ] || return 0
+  mkdir -p "$ICON_ROOT/$size/apps"
+  install -m 644 "$src" "$ICON_ROOT/$size/apps/ionconnect.png"
+}
+install_icon "$ICONS_SRC/32x32.png" 32x32
+install_icon "$ICONS_SRC/128x128.png" 128x128
+install_icon "$ICONS_SRC/128x128@2x.png" 256x256
+install_icon "$ICONS_SRC/icon.png" 512x512
+
 cat > "$DESKTOP_DIR/ionconnect.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -69,8 +82,15 @@ Exec=$BIN_DIR/ionconnect-gui
 Icon=ionconnect
 Terminal=false
 Categories=Utility;Network;
+# El escritorio asocia una ventana con su lanzador comparando el WM_CLASS
+# de la ventana contra este campo (o, si falta, contra el nombre del
+# archivo .desktop). La ventana de Tauri reporta "ionconnect-gui", que no
+# coincide con "ionconnect", así que sin esta línea GNOME no encuentra el
+# lanzador y muestra un icono genérico en el dock.
+StartupWMClass=ionconnect-gui
 EOF
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$ICON_ROOT" >/dev/null 2>&1 || true
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
