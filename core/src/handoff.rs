@@ -105,9 +105,13 @@ impl HandoffState {
         self.layout.set_desktop(device, desktop);
     }
 
-    /// Límites del escritorio virtual asumido para `device` en este
-    /// momento — para debug/tests y para que la GUI pueda mostrar si ya
-    /// llegó la resolución real de un peer o todavía es la copia inicial.
+    /// Límites del escritorio virtual vigente para `device` en este
+    /// momento: la resolución que el peer reportó por `DisplayGeometry`, o
+    /// —si nunca la reportó— la copia de la geometría local con la que se
+    /// armó el `Layout` al arrancar. `core::server` lo consulta justo
+    /// después de aplicar una actualización para dejar constancia en el log
+    /// de qué rectángulo quedó realmente en uso, que es lo que hace falta
+    /// para diagnosticar un cursor que se frena antes del borde del peer.
     #[must_use]
     pub fn peer_bounds(&self, device: DeviceId) -> Option<ionconnect_screen::MonitorGeometry> {
         self.layout.desktop(device).and_then(VirtualDesktop::bounds)
@@ -219,6 +223,39 @@ mod tests {
         assert_eq!(state.clamp_to_active_desktop(500, -5000), (500, 0));
         // Dentro de límites: no toca nada.
         assert_eq!(state.clamp_to_active_desktop(500, 300), (500, 300));
+    }
+
+    /// El caso de dos pantallas de distinto tamaño: hasta que el peer
+    /// reporta su resolución real se asume la del servidor, así que el
+    /// clamp recorta contra un alto que no es el suyo — el síntoma es un
+    /// cursor que se frena antes del borde físico del peer.
+    #[test]
+    fn reported_peer_geometry_replaces_the_assumed_one_for_clamping() {
+        let local = DeviceId::new();
+        let remote = DeviceId::new();
+        // El layout arranca asumiendo que el peer mide igual que el local.
+        let mut state = HandoffState::new(layout_with_one_neighbor(local, remote), local);
+        state.on_position(1920, 540);
+        assert_eq!(state.active(), Active::Remote(remote));
+        assert_eq!(
+            state.peer_bounds(remote),
+            Some(MonitorGeometry::new(0, 0, 1920, 1080))
+        );
+        // Con la geometría asumida, el cursor se recorta a los 1080px del
+        // servidor aunque el peer sea más chico.
+        assert_eq!(state.clamp_to_active_desktop(500, 1200), (500, 1079));
+
+        // El peer reporta su pantalla real, más baja.
+        state.update_peer_geometry(remote, desktop(1280, 800));
+
+        assert_eq!(
+            state.peer_bounds(remote),
+            Some(MonitorGeometry::new(0, 0, 1280, 800))
+        );
+        // Ahora el recorte usa el alto real, y el borde inferior del peer
+        // queda alcanzable en vez de quedar 280px más abajo del clamp.
+        assert_eq!(state.clamp_to_active_desktop(500, 1200), (500, 799));
+        assert_eq!(state.clamp_to_active_desktop(1500, 400), (1279, 400));
     }
 
     #[test]

@@ -348,16 +348,11 @@ async fn handle_peer_connection(
                         }
                     }
                     Some(Message::DisplayGeometry(geometry)) => {
-                        info!(
-                            device_id = %auth.device_id,
-                            width = geometry.width,
-                            height = geometry.height,
-                            "resolución real del peer recibida"
-                        );
-                        handoff
-                            .lock()
-                            .expect("el lock de handoff no debería estar envenenado")
-                            .update_peer_geometry(
+                        let effective = {
+                            let mut guard = handoff
+                                .lock()
+                                .expect("el lock de handoff no debería estar envenenado");
+                            guard.update_peer_geometry(
                                 auth.device_id,
                                 VirtualDesktop::new(vec![MonitorGeometry::new(
                                     0,
@@ -366,6 +361,20 @@ async fn handle_peer_connection(
                                     geometry.height,
                                 )]),
                             );
+                            guard.peer_bounds(auth.device_id)
+                        };
+                        // Se loguea el rectángulo que quedó vigente, no solo el
+                        // que llegó: cuando el cursor se frena antes del borde
+                        // físico del peer, esta línea es la que distingue "el
+                        // servidor nunca recibió la resolución real y sigue
+                        // asumiendo la suya" de un problema de layout.
+                        info!(
+                            device_id = %auth.device_id,
+                            width = geometry.width,
+                            height = geometry.height,
+                            ?effective,
+                            "resolución real del peer aplicada"
+                        );
                     }
                     Some(Message::UdpHello(hello)) => {
                         let addr = std::net::SocketAddr::new(peer_ip, hello.port);
