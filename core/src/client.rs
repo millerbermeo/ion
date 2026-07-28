@@ -156,12 +156,12 @@ fn local_display_geometry() -> Option<DisplayGeometry> {
         // El portal `RemoteDesktop` que usa el cliente Wayland no expone
         // todavía una forma barata de consultar la geometría real (a
         // diferencia del portal `InputCapture` del lado servidor, que sí
-        // tiene `zones()`) — se deja para cuando haga falta en vez de
-        // pedir un permiso extra solo para esto.
-        let is_wayland = std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
-        if is_wayland {
-            return None;
-        }
+        // tiene `zones()`), pero casi toda sesión Wayland tiene un
+        // `XWayland` detrás — el mismo que usa `create_injector` para
+        // XTEST — así que se intenta igual por ahí en vez de rendirse de
+        // entrada solo por ver `XDG_SESSION_TYPE=wayland`. Si no hay
+        // XWayland (o no hay ningún X11 disponible), `root_geometry`
+        // simplemente falla y se cae a `None`, igual que antes.
         return ionconnect_input::x11::X11Control::root_geometry()
             .ok()
             .map(|(width, height)| DisplayGeometry { width, height });
