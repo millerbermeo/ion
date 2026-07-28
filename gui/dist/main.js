@@ -217,15 +217,23 @@ async function saveSettings(event) {
     server_address: serverAddress.length > 0 ? serverAddress : null,
     peers: peers.filter((p) => p.device_id.length > 0 && p.name.length > 0),
   };
-  const status = document.getElementById("save-status");
   try {
     await invoke()("save_settings", { settings });
-    status.textContent = "Guardado.";
+    showToast("✓ Configuración guardada correctamente", "success");
   } catch (error) {
-    status.textContent = `Error al guardar: ${error}`;
+    showToast(`✕ Error al guardar: ${error}`, "error");
   }
-  setTimeout(() => {
-    status.textContent = "";
+}
+
+let toastTimeout;
+function showToast(message, type) {
+  const status = document.getElementById("save-status");
+  clearTimeout(toastTimeout);
+  status.textContent = message;
+  status.classList.remove("save-status--success", "save-status--error");
+  status.classList.add(`save-status--${type}`, "save-status--visible");
+  toastTimeout = setTimeout(() => {
+    status.classList.remove("save-status--visible");
   }, 3000);
 }
 

@@ -45,10 +45,6 @@
               Nombre de este equipo
               <input type="text" id="device_name" name="device_name" required />
             </label>
-            <label>
-              Puerto de escucha
-              <input type="number" id="listen_port" name="listen_port" min="1" max="65535" required />
-            </label>
             <label class="checkbox">
               <input type="checkbox" id="discovery_enabled" name="discovery_enabled" />
               Descubrimiento automático en la LAN (mDNS)
@@ -87,6 +83,10 @@
             </div>
 
             <div id="server-fields" class="role-fields" hidden>
+              <label>
+                Puerto de escucha
+                <input type="number" id="listen_port" name="listen_port" min="1" max="65535" required />
+              </label>
               <p class="hint">
                 Un equipo por cada lado de esta pantalla a la que el mouse pueda "salir".
                 Pegá acá el ID que la GUI de esa otra máquina muestra en "Este equipo".

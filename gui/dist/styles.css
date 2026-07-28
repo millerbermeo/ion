@@ -156,8 +156,36 @@ body {
 }
 
 .save-status {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.1rem;
+  border-radius: 0.6rem;
   font-size: 0.85rem;
-  color: var(--success);
+  font-weight: 600;
+  color: var(--accent-contrast);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  transform: translateY(0.5rem);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  z-index: 1000;
+}
+
+.save-status--visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.save-status--success {
+  background: var(--success);
+}
+
+.save-status--error {
+  background: var(--danger);
 }
 
 .device-id-row {
