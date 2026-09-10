@@ -32,13 +32,31 @@ static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 /// monopolizar la conexión frente al mouse/teclado.
 pub const CHUNK_SIZE: usize = 128 * 1024;
 
-/// `~/Downloads/ionconnect` — donde caen los archivos recibidos.
+/// Carpeta `ionconnect` en el **Escritorio** del usuario — el mismo lugar en
+/// todos los sistemas operativos, independiente del nombre localizado de la
+/// carpeta ("Escritorio", "Desktop", ...). `dirs::desktop_dir` resuelve el
+/// nombre real (XDG `user-dirs.dirs` en Linux, carpeta conocida en Windows,
+/// `~/Desktop` en macOS); si no se puede, se cae a `~/Desktop` y por último
+/// al directorio actual. La carpeta se crea sola en la primera recepción
+/// (ver [`IncomingFiles::on_offer`]) y también al arrancar `core`.
 #[must_use]
-pub fn default_download_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join("Downloads").join("ionconnect")
+pub fn default_transfer_dir() -> PathBuf {
+    let desktop = dirs::desktop_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Desktop")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    desktop.join("ionconnect")
+}
+
+/// Crea la carpeta de transferencias si no existe — se llama al arrancar
+/// `core` para que el usuario la vea antes de la primera transferencia.
+pub async fn ensure_transfer_dir() {
+    let dir = default_transfer_dir();
+    match fs::create_dir_all(&dir).await {
+        Ok(()) => info!(dir = %dir.display(), "carpeta de transferencias lista"),
+        Err(err) => {
+            warn!(%err, dir = %dir.display(), "no se pudo crear la carpeta de transferencias")
+        }
+    }
 }
 
 /// Adivina un `MIME` razonable por la extensión — no vale la pena una
@@ -389,6 +407,22 @@ mod tests {
         x ^= x >> 17;
         x ^= x << 5;
         x
+    }
+
+    #[test]
+    fn transfer_dir_is_ionconnect_under_the_desktop() {
+        let dir = default_transfer_dir();
+        assert_eq!(
+            dir.file_name().and_then(|s| s.to_str()),
+            Some("ionconnect"),
+            "el último componente siempre es `ionconnect`"
+        );
+        // El padre es el escritorio: su nombre varía por SO/idioma, pero
+        // nunca debería ser la raíz ni quedar vacío.
+        assert!(
+            dir.parent().is_some_and(|p| !p.as_os_str().is_empty()),
+            "debería colgar de una carpeta de escritorio real"
+        );
     }
 
     #[test]

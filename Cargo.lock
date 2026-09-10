@@ -1896,6 +1896,7 @@ name = "ionconnect-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "ionconnect-clipboard",
  "ionconnect-config",
  "ionconnect-crypto",

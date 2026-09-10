@@ -81,6 +81,8 @@ pub async fn run_client(
         config_dir.join("ipc.token"),
         FileSink::Channel(outgoing_tx),
     ));
+    // Crea `<Escritorio>/ionconnect` ya, para que el usuario la vea.
+    tokio::spawn(crate::file_transfer::ensure_transfer_dir());
 
     let mut backoff = Backoff::new(BackoffPolicy::default());
     loop {
@@ -389,11 +391,10 @@ async fn session_loop(
     let poller = tokio::spawn(poll_clipboard_changes(clipboard.clone(), clipboard_tx));
 
     // Transferencias entrantes desde el servidor — se escriben a
-    // `~/Downloads/ionconnect/`. Vive por sesión; los `.part` a medias se
+    // `<Escritorio>/ionconnect/`. Vive por sesión; los `.part` a medias se
     // descartan al terminar.
-    let mut incoming_files = crate::file_transfer::IncomingFiles::new(
-        crate::file_transfer::default_download_dir(),
-    );
+    let mut incoming_files =
+        crate::file_transfer::IncomingFiles::new(crate::file_transfer::default_transfer_dir());
 
     // La inyección corre como un futuro concurrente al bucle de red, no como
     // una rama del mismo `select!` (ver `injection_task` para el porqué):

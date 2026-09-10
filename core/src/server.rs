@@ -127,6 +127,8 @@ pub async fn run_server(
         config_dir.join("ipc.token"),
         crate::file_transfer::FileSink::Broadcast(routing.clone()),
     ));
+    // Crea `<Escritorio>/ionconnect` ya, para que el usuario la vea.
+    tokio::spawn(crate::file_transfer::ensure_transfer_dir());
 
     let handoff = Arc::new(std::sync::Mutex::new(crate::handoff::HandoffState::new(
         layout,
@@ -370,10 +372,10 @@ async fn handle_peer_connection(
     routing.register(auth.device_id, tx);
 
     // Transferencias entrantes de este peer — se van escribiendo a
-    // `~/Downloads/ionconnect/`. `transfer_id` es del emisor, así que un
+    // `<Escritorio>/ionconnect/`. `transfer_id` es del emisor, así que un
     // mapa por conexión no colisiona.
     let mut incoming_files =
-        crate::file_transfer::IncomingFiles::new(crate::file_transfer::default_download_dir());
+        crate::file_transfer::IncomingFiles::new(crate::file_transfer::default_transfer_dir());
 
     loop {
         tokio::select! {

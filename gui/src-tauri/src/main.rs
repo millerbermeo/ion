@@ -39,7 +39,7 @@ fn main() {
             // Arrastrar archivos a la ventana los manda al otro equipo. El
             // drag&drop se maneja acá (no en el webview) para no depender de
             // permisos de eventos en el frontend; `core` los transfiere y el
-            // otro lado los guarda en ~/Downloads/ionconnect.
+            // otro lado los guarda en la carpeta `ionconnect` del Escritorio.
             WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
                 let paths: Vec<String> = paths
                     .iter()
