@@ -84,6 +84,56 @@ fn capture_reports_injected_motion() {
 
 #[test]
 #[ignore = "requiere un servidor X real (Xephyr/Xvfb) en $DISPLAY"]
+fn capture_emits_absolute_position_while_control_is_local() {
+    // Con el control local (el default), la captura debe resincronizar con
+    // la posición real del cursor vía `query_pointer` y emitir
+    // `AbsolutePosition` — sin esto la posición acumulada deriva y el cruce
+    // de borde nunca se detecta en un escritorio real.
+    let (tx, rx) = mpsc::channel();
+    let position = SharedPosition::new(0, 0);
+    let mut capture = X11Capture::connect(position).expect("XInput2 debería estar disponible");
+
+    let handle = std::thread::spawn(move || {
+        use ionconnect_input::InputCapture as _;
+        let _ = capture.run(tx);
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    let mut injector = X11Injector::connect().expect("XTEST debería estar disponible");
+    // Varios movimientos para pasar el throttle de query_pointer.
+    for i in 0..20 {
+        injector
+            .inject(&CapturedEvent::MouseMove {
+                x: 40 + i * 3,
+                y: 40 + i * 2,
+            })
+            .expect("mover el mouse no debería fallar");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_absolute = false;
+    while std::time::Instant::now() < deadline {
+        let Ok(event) =
+            rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        else {
+            break;
+        };
+        if matches!(event, CapturedEvent::AbsolutePosition { .. }) {
+            saw_absolute = true;
+            break;
+        }
+    }
+    assert!(
+        saw_absolute,
+        "se esperaba al menos un AbsolutePosition (resync vía query_pointer)"
+    );
+
+    drop(handle);
+}
+
+#[test]
+#[ignore = "requiere un servidor X real (Xephyr/Xvfb) en $DISPLAY"]
 fn grab_ungrab_and_warp_do_not_error() {
     let control = X11Control::connect().expect("la conexión de control no debería fallar");
 

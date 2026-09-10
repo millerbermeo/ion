@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ionconnect_shared::KeyModifiers;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xinput::{ConnectionExt as _, EventMask, XIEventMask};
-use x11rb::protocol::xproto::Window;
+use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
 use crate::capture::InputCapture;
@@ -99,10 +100,26 @@ impl SharedPosition {
 ///   con el puntero agarrado y oculto en el borde, que es exactamente la
 ///   situación tras un hand-off → [`CapturedEvent::MouseMove`] (acumulado
 ///   sobre [`SharedPosition`]).
+/// Cada cuánto, como máximo, se consulta la posición real del puntero
+/// (`query_pointer`) mientras el control es local. Es un round-trip al
+/// servidor X; a ~165 Hz alcanza de sobra para detectar un cruce de borde y
+/// no satura la conexión.
+const POINTER_QUERY_INTERVAL: Duration = Duration::from_millis(6);
+
 pub struct X11Capture {
     conn: RustConnection,
+    root: Window,
     position: SharedPosition,
     stop_flag: Arc<AtomicBool>,
+    /// `true` mientras el control lo tiene este equipo. Mientras es local se
+    /// resincroniza [`SharedPosition`] con la posición real del cursor en
+    /// cada movimiento (throttled a [`POINTER_QUERY_INTERVAL`]); mientras es
+    /// remoto **no** — ahí el puntero está agarrado y confinado en el borde,
+    /// así que `query_pointer` devolvería siempre ese punto fijo y pisaría
+    /// la posición acumulada a partir de deltas, que es justo lo que hay que
+    /// seguir. `core` lo actualiza según el estado de hand-off.
+    local_control: Arc<AtomicBool>,
+    last_pointer_query: Instant,
 }
 
 impl X11Capture {
@@ -158,9 +175,22 @@ impl X11Capture {
 
         Ok(Self {
             conn,
+            root,
             position,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            local_control: Arc::new(AtomicBool::new(true)),
+            last_pointer_query: Instant::now()
+                .checked_sub(POINTER_QUERY_INTERVAL)
+                .unwrap_or_else(Instant::now),
         })
+    }
+
+    /// Bandera que `core` usa para avisarle a la captura si el control es
+    /// local (resincronizar con el cursor real) o remoto (seguir solo los
+    /// deltas crudos). Ver [`X11Capture::local_control`].
+    #[must_use]
+    pub fn local_control_flag(&self) -> Arc<AtomicBool> {
+        self.local_control.clone()
     }
 
     #[must_use]
@@ -181,6 +211,31 @@ impl InputCapture for X11Capture {
                 Event::XinputRawMotion(ev) => {
                     let dx = valuator_value(&ev.valuator_mask, &ev.axisvalues, 0).unwrap_or(0.0);
                     let dy = valuator_value(&ev.valuator_mask, &ev.axisvalues, 1).unwrap_or(0.0);
+
+                    // Mientras el control es local, resincronizar la posición
+                    // acumulada con la REAL del cursor. Los eventos cocidos
+                    // `XI_Motion` casi nunca llegan al root en un escritorio
+                    // real (las apps enfocadas los consumen), así que sin
+                    // esto `SharedPosition` deriva sola y el cruce de borde
+                    // no se detecta nunca. `query_pointer` sí es fiable.
+                    if self.local_control.load(Ordering::Relaxed)
+                        && self.last_pointer_query.elapsed() >= POINTER_QUERY_INTERVAL
+                    {
+                        self.last_pointer_query = Instant::now();
+                        if let Ok(cookie) = self.conn.query_pointer(self.root)
+                            && let Ok(reply) = cookie.reply()
+                        {
+                            let (rx, ry) = (i32::from(reply.root_x), i32::from(reply.root_y));
+                            self.position.reset(rx, ry);
+                            if sink
+                                .send(CapturedEvent::AbsolutePosition { x: rx, y: ry })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+
                     let (x, y) = self
                         .position
                         .add(clamp_delta_to_i32(dx), clamp_delta_to_i32(dy));

@@ -338,6 +338,10 @@ pub fn run_x11_input_session(
 ) -> Result<(), InputError> {
     let position = SharedPosition::new(0, 0);
     let mut capture = X11Capture::connect(position.clone())?;
+    // La captura resincroniza la posición con el cursor real solo mientras
+    // el control es local (ver `X11Capture::local_control`). Arranca en
+    // `true` porque `HandoffState` arranca en `Active::Local`.
+    let local_control = capture.local_control_flag();
     let control = X11Control::connect()?;
     let repeat = control.key_repeat_settings();
     info!(
@@ -384,6 +388,17 @@ pub fn run_x11_input_session(
         }
         emit_due_key_repeats(handoff, routing, &position, &mut session);
         session.flush_pending_move(routing, udp_peers);
+
+        // Avisarle a la captura si el control sigue local o pasó a remoto,
+        // para que resincronice (o no) con `query_pointer`.
+        let is_local = matches!(
+            handoff
+                .lock()
+                .expect("el lock de handoff no debería estar envenenado")
+                .active(),
+            Active::Local
+        );
+        local_control.store(is_local, Ordering::Relaxed);
     }
 
     let _ = capture_thread.join();
