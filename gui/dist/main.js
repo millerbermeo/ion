@@ -428,7 +428,10 @@ async function loadSettings() {
   document.getElementById("listen_port").value = settings.listen_port;
   document.getElementById("discovery_enabled").checked = settings.discovery_enabled;
   document.getElementById("pairing_mode").value = settings.pairing_mode;
-  document.getElementById("log_level").value = settings.log_level;
+  // Si el valor guardado no existe como opción, cae en "Todos".
+  const logLevel = document.getElementById("log_level");
+  logLevel.value = settings.log_level;
+  if (!logLevel.value) logLevel.value = "all";
   document.getElementById("role").value = settings.role;
   document.getElementById("server_address").value = settings.server_address ?? "";
   peers = (settings.peers ?? []).map((p) => ({ ...p }));
@@ -523,10 +526,52 @@ async function loadDevices() {
 }
 
 /* ==========================================================================
+   Confirmación al cerrar la ventana
+   El backend (Rust) intercepta el cierre real (`CloseRequested` →
+   `prevent_close`) y llama a `window.__ionCloseRequested()` vía `eval`. Acá
+   solo se muestra el modal; "Cerrar" invoca `confirm_close`, que hace salir
+   la app de forma ordenada (SIGTERM a core → avisa a los peers).
+   ========================================================================== */
+
+function showCloseModal() {
+  const overlay = document.getElementById("close-modal");
+  overlay.hidden = false;
+  document.getElementById("close-cancel").focus();
+}
+
+function hideCloseModal() {
+  document.getElementById("close-modal").hidden = true;
+}
+
+async function confirmClose() {
+  const btn = document.getElementById("close-confirm");
+  btn.disabled = true;
+  try {
+    await invoke()("confirm_close");
+  } catch {
+    // Si falla, al menos que no quede el botón trabado.
+    btn.disabled = false;
+  }
+}
+
+/* ==========================================================================
    Arranque
    ========================================================================== */
 
 window.addEventListener("DOMContentLoaded", () => {
+  window.__ionCloseRequested = showCloseModal;
+  document.getElementById("close-cancel").addEventListener("click", hideCloseModal);
+  document.getElementById("close-confirm").addEventListener("click", confirmClose);
+  document.getElementById("close-modal").addEventListener("click", (event) => {
+    // Click en el fondo oscuro = cancelar.
+    if (event.target.id === "close-modal") hideCloseModal();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.getElementById("close-modal").hidden) {
+      hideCloseModal();
+    }
+  });
+
   renderThemeToggle();
   document.getElementById("copy-device-id").innerHTML = ICONS.copy;
 

@@ -95,6 +95,17 @@ pub fn graceful_kill(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Traduce el valor del select de nivel de registro de la GUI al filtro
+/// `RUST_LOG` que entiende `tracing`. "Todos" (`all`) = todo, incluidas las
+/// dependencias.
+fn log_level_to_rust_log(level: &str) -> String {
+    match level {
+        "all" | "todos" => "trace".to_string(),
+        "error" | "warn" | "info" | "debug" | "trace" => level.to_string(),
+        _ => "info".to_string(),
+    }
+}
+
 /// Ruta al binario `ionconnect-core`. Se asume instalado junto a la GUI
 /// (así lo deja `install.sh`); si no está ahí, se cae a resolverlo por
 /// `PATH` como último recurso.
@@ -260,6 +271,19 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
     let mut command = Command::new(&bin);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    // Nivel de registro elegido en la GUI → `RUST_LOG` del hijo (que
+    // `tracing_subscriber::fmt::init` ya honra). "Todos" = `trace`. Si el
+    // usuario ya trae `RUST_LOG` en el entorno, se respeta.
+    if std::env::var_os("RUST_LOG").is_none() {
+        let level = state
+            .settings
+            .lock()
+            .expect("el lock de configuración no debería estar envenenado")
+            .log_level
+            .clone();
+        command.env("RUST_LOG", log_level_to_rust_log(&level));
+    }
+
     // Si la GUI muere (cierre normal o crash), el kernel le manda SIGTERM a
     // `core` en vez de dejarlo huérfano escuchando el puerto — la GUI es la
     // única forma de tenerlo corriendo, así no quedan procesos de fondo.
@@ -351,6 +375,15 @@ pub async fn send_files(state: State<'_, AppState>, paths: Vec<String>) -> Resul
     let token_file = state.config_path.with_file_name("ipc.token");
     send_files_over_ipc(token_file, paths).await;
     Ok(())
+}
+
+/// El usuario confirmó en el modal que quiere cerrar. Sale de la app de
+/// forma ordenada: dispara `RunEvent::Exit`, que apaga `ionconnect-core` con
+/// SIGTERM (`graceful_kill`), y este a su vez avisa a los peers con
+/// `Disconnect` antes de terminar.
+#[tauri::command]
+pub fn confirm_close(app: AppHandle) {
+    app.exit(0);
 }
 
 /// Mata el proceso `ionconnect-core` iniciado por [`start_core`], si hay

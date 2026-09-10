@@ -72,7 +72,7 @@ impl Default for Settings {
             listen_port: 44890,
             discovery_enabled: true,
             pairing_mode: PairingModePreference::RejectUnknown,
-            log_level: "info".to_string(),
+            log_level: "all".to_string(),
             role: Role::Server,
             peers: Vec::new(),
             server_address: None,
