@@ -192,12 +192,29 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-/// Extrae el valor de un campo `clave=valor` separado por espacios (el
-/// formato que usa `tracing_subscriber` para campos estructurados).
+/// Extrae el valor de un campo `clave=valor` de una línea de `tracing`.
+/// `tracing` escribe el valor **entre comillas** cuando tiene espacios
+/// (`server="mi pc"`) y sin comillas cuando no (`server=cli`); esta función
+/// maneja los dos casos — un `split_whitespace` ingenuo partía el valor con
+/// espacios y devolvía basura (o nada), y por eso el equipo remoto no
+/// aparecía en la lista de la GUI.
 fn extract_field(line: &str, prefix: &str) -> Option<String> {
-    line.split_whitespace()
-        .find_map(|tok| tok.strip_prefix(prefix))
-        .map(str::to_string)
+    // `tracing` siempre separa los campos con un espacio (` clave=valor`);
+    // buscar ` prefix` evita que `name=` matchee dentro de `device_name=`.
+    let spaced = format!(" {prefix}");
+    let after = line.splitn(2, spaced.as_str()).nth(1)?;
+    let value = if let Some(rest) = after.strip_prefix('"') {
+        // Valor citado: hasta la comilla de cierre.
+        rest.split('"').next().unwrap_or(rest)
+    } else {
+        // Sin comillas: hasta el próximo espacio.
+        after.split_whitespace().next().unwrap_or(after)
+    };
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Lee `reader` línea a línea en un hilo dedicado, la limpia de ANSI, y
@@ -295,13 +312,16 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
                         peers.retain(|p| p.device_id != device_id);
                     }
                 } else if line.contains("conectado al servidor") {
-                    if let Some(name) = extract_field(&line, "server=") {
-                        peers.retain(|p| p.device_id != "server");
-                        peers.push(ConnectedPeer {
-                            device_id: "server".to_string(),
-                            name,
-                        });
-                    }
+                    // Siempre agregar la fila, aunque el nombre no se pueda
+                    // parsear — lo importante es que el usuario vea que está
+                    // conectado.
+                    let name = extract_field(&line, "server=")
+                        .unwrap_or_else(|| "Servidor".to_string());
+                    peers.retain(|p| p.device_id != "server");
+                    peers.push(ConnectedPeer {
+                        device_id: "server".to_string(),
+                        name,
+                    });
                 } else if line.contains("reintentando conexión") {
                     peers.retain(|p| p.device_id != "server");
                 }
@@ -592,5 +612,55 @@ pub fn get_core_snapshot(state: State<AppState>) -> CoreSnapshot {
         log,
         received_files,
         sent_files,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_line, extract_field, strip_ansi};
+
+    #[test]
+    fn extract_field_handles_unquoted_and_quoted_values() {
+        assert_eq!(
+            extract_field("... conectado al servidor server=cli", "server="),
+            Some("cli".to_string())
+        );
+        // `tracing` cita los valores con espacios — este era el caso que
+        // dejaba al servidor sin aparecer en la lista de la GUI.
+        assert_eq!(
+            extract_field("... conectado al servidor server=\"mi pc\"", "server="),
+            Some("mi pc".to_string())
+        );
+        assert_eq!(
+            extract_field("peer autenticado device_id=abc123 name=laptop", "name="),
+            Some("laptop".to_string())
+        );
+        // `name=` no debe matchear dentro de `device_name=`.
+        assert_eq!(
+            extract_field("x device_name=foo name=bar", "name="),
+            Some("bar".to_string())
+        );
+        assert_eq!(extract_field("sin el campo", "server="), None);
+    }
+
+    #[test]
+    fn extract_field_works_after_stripping_ansi() {
+        let raw = "\x1b[2m2026\x1b[0m INFO x: conectado al servidor \x1b[3mserver\x1b[0m\x1b[2m=\x1b[0mcli";
+        assert_eq!(
+            extract_field(&strip_ansi(raw), "server="),
+            Some("cli".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_line_prefers_connected_over_generic_error() {
+        assert_eq!(
+            classify_line("... conectado al servidor server=cli"),
+            Some("connected")
+        );
+        assert_eq!(
+            classify_line("ERROR ...: Address already in use (os error 98)"),
+            Some("port_busy")
+        );
     }
 }

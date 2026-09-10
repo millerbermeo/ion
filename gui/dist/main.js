@@ -279,7 +279,7 @@ async function pollCoreSnapshot() {
     renderReceivedFiles(snapshot.received_files);
     renderSentFiles(snapshot.sent_files);
     updateCoreToggleLabel();
-    await loadDevices();
+    await loadDevices(snapshot.running ? snapshot.status : "stopped");
   } catch {
     // get_core_snapshot no debería fallar nunca; si pasa, seguimos
     // sondeando en el próximo tick en vez de romper el polling.
@@ -557,8 +557,14 @@ function showToast(message, type) {
    Equipos conectados
    ========================================================================== */
 
-async function loadDevices() {
-  const devices = await invoke()("list_devices");
+async function loadDevices(status) {
+  let devices = await invoke()("list_devices");
+  // Red de seguridad: si `core` dice "connected" pero el parseo del log no
+  // dejó ninguna fila (nombre raro, línea que scrolleó), mostrar igual que
+  // hay un equipo conectado.
+  if (devices.length === 0 && status === "connected") {
+    devices = [{ name: "Equipo remoto", connected: true, latency_ms: null }];
+  }
   const list = document.getElementById("device-list");
   const count = document.getElementById("peer-count-indicator");
 
