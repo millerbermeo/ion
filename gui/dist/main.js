@@ -175,22 +175,96 @@ function setCoreLog(lines) {
 /// Única fuente de verdad para el estado de `core`: no confiamos en que
 /// los eventos hayan llegado bien al webview, así que consultamos
 /// `get_core_snapshot` cada segundo y pintamos lo que diga el backend.
+const SPINNER =
+  '<svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" stroke-opacity="0.25"/><path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>';
+
 function renderReceivedFiles(files) {
+  const box = document.getElementById("received-files-box");
   const list = document.getElementById("received-files");
-  if (!list) return;
+  if (!list || !box) return;
   const items = Array.isArray(files) ? files : [];
-  // Solo repintar si cambió, para no pisar el scroll.
   const signature = items.join("\n");
   if (list.dataset.signature === signature) return;
   list.dataset.signature = signature;
 
+  box.hidden = items.length === 0;
   list.innerHTML = "";
   for (const path of items.slice().reverse()) {
     const name = path.split("/").pop() || path;
-    const item = el("li", "received-list__item");
-    item.append(el("span", "received-list__name", name));
-    item.append(el("span", "received-list__path", path));
+    const item = el("li", "transfer-list__item");
+    item.append(el("span", "transfer-list__icon transfer-list__icon--ok", "✓"));
+    const body = el("div", "transfer-list__body");
+    body.append(el("span", "transfer-list__name", name));
+    body.append(el("span", "transfer-list__path", path));
+    item.append(body);
     list.append(item);
+  }
+}
+
+/// Progreso de los archivos que este equipo está mandando: spinner mientras
+/// `core` no logueó `archivo enviado`, ✓ al terminar, ✕ si falló.
+function renderSentFiles(files) {
+  const box = document.getElementById("sent-files-box");
+  const list = document.getElementById("sent-files");
+  if (!list || !box) return;
+  const items = Array.isArray(files) ? files : [];
+  const signature = items.map((f) => `${f.name}:${f.done}:${f.failed}`).join("\n");
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
+
+  box.hidden = items.length === 0;
+  document.querySelector("#sent-files-box .file-group__label").textContent =
+    items.some((f) => !f.done && !f.failed) ? "Enviando…" : "Enviados";
+
+  list.innerHTML = "";
+  for (const f of items.slice().reverse()) {
+    const item = el("li", "transfer-list__item");
+    let icon;
+    if (f.failed) {
+      icon = el("span", "transfer-list__icon transfer-list__icon--err", "✕");
+    } else if (f.done) {
+      icon = el("span", "transfer-list__icon transfer-list__icon--ok", "✓");
+    } else {
+      icon = el("span", "transfer-list__icon transfer-list__icon--pending");
+      icon.innerHTML = SPINNER;
+    }
+    item.append(icon);
+    const body = el("div", "transfer-list__body");
+    body.append(el("span", "transfer-list__name", f.name));
+    body.append(
+      el(
+        "span",
+        "transfer-list__path",
+        f.failed ? "no se pudo leer el archivo" : f.done ? "enviado" : "enviando…",
+      ),
+    );
+    item.append(body);
+    list.append(item);
+  }
+}
+
+/// Rutas soltadas en la ventana (las pasa el backend vía `eval`) o elegidas
+/// en el diálogo — se mandan por `send_files` y el resultado va a un toast.
+window.__ionFilesDropped = async (paths) => {
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  try {
+    const message = await invoke()("send_files", { paths });
+    showToast(message, "success");
+  } catch (error) {
+    showToast(String(error), "error");
+  }
+};
+
+async function pickAndSendFiles() {
+  const btn = document.getElementById("pick-files");
+  btn.disabled = true;
+  try {
+    const message = await invoke()("send_files_dialog");
+    if (message && message !== "Selección cancelada.") showToast(message, "success");
+  } catch (error) {
+    showToast(String(error), "error");
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -201,6 +275,7 @@ async function pollCoreSnapshot() {
     setConnectionIndicator(snapshot.running ? snapshot.status : "stopped");
     setCoreLog(snapshot.log);
     renderReceivedFiles(snapshot.received_files);
+    renderSentFiles(snapshot.sent_files);
     updateCoreToggleLabel();
     await loadDevices();
   } catch {
@@ -587,6 +662,7 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("screen-map").addEventListener("keydown", onScreenMapKeydown);
   document.getElementById("settings-form").addEventListener("submit", saveSettings);
   document.getElementById("core-toggle").addEventListener("click", toggleCore);
+  document.getElementById("pick-files").addEventListener("click", pickAndSendFiles);
 
   startCorePolling();
 

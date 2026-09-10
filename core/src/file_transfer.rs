@@ -98,7 +98,13 @@ fn sanitize_name(name: &str) -> String {
         .unwrap_or("archivo");
     let cleaned: String = base
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
@@ -116,10 +122,7 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
         return direct;
     }
     let as_path = Path::new(name);
-    let stem = as_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(name);
+    let stem = as_path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
     let ext = as_path.extension().and_then(|s| s.to_str());
     for n in 1..10_000 {
         let candidate = match ext {
@@ -255,7 +258,10 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
     let mut file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(err) => {
-            warn!(%err, path = %path.display(), "no se pudo abrir el archivo a enviar");
+            // `name` va último y sin comillas en el formato de `tracing`
+            // cuando no tiene espacios; la GUI parsea de `name=` al fin de
+            // línea, así que soporta nombres con espacios.
+            warn!(%err, %name, "no se pudo abrir el archivo a enviar");
             return;
         }
     };
@@ -274,7 +280,7 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
     {
         return;
     }
-    info!(%name, size = total, "enviando archivo");
+    info!(size = total, %name, "enviando archivo");
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
@@ -296,7 +302,7 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
                 tokio::task::yield_now().await;
             }
             Err(err) => {
-                warn!(%err, "error leyendo el archivo — se aborta la transferencia");
+                warn!(%err, %name, "error leyendo el archivo — se aborta la transferencia");
                 let _ = sink
                     .send(Message::FileAbort(FileAbort {
                         transfer_id,
@@ -423,6 +429,81 @@ mod tests {
             dir.parent().is_some_and(|p| !p.as_os_str().is_empty()),
             "debería colgar de una carpeta de escritorio real"
         );
+    }
+
+    /// Camino completo del envío por drag&drop: la "GUI" se conecta al canal
+    /// IPC local y manda un `FileOffer` con una ruta local; `serve_ipc_file_sends`
+    /// lee ese archivo y lo difunde por `Routing`; se reensambla del otro
+    /// lado con `IncomingFiles`. Prueba justo lo que el usuario reportó roto.
+    #[tokio::test]
+    async fn drag_drop_over_ipc_reaches_the_peer_and_writes_the_file() {
+        let workdir = tmp_dir("ipc");
+        let token_file = workdir.join("ipc.token");
+
+        // Archivo local que la "GUI" va a soltar.
+        let source = workdir.join("documento.txt");
+        let payload = b"contenido de prueba para la transferencia".to_vec();
+        std::fs::write(&source, &payload).unwrap();
+
+        // Peer falso registrado en Routing.
+        let routing = Arc::new(Routing::new());
+        let peer = ionconnect_shared::DeviceId::new();
+        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+        routing.register(peer, peer_tx);
+
+        // Mitad "enviar": el canal IPC local.
+        tokio::spawn(serve_ipc_file_sends(
+            token_file.clone(),
+            FileSink::Broadcast(routing.clone()),
+        ));
+
+        // La "GUI" se conecta y suelta el archivo (esperando a que el
+        // servidor IPC publique el token).
+        let mut gui = None;
+        for _ in 0..50 {
+            match ionconnect_ipc::IpcClient::connect(&token_file).await {
+                Ok(conn) => {
+                    gui = Some(conn);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let mut gui = gui.expect("el canal IPC local debería aceptar la conexión");
+        gui.send(Message::FileOffer(FileOffer {
+            transfer_id: 0,
+            name: source.to_string_lossy().into_owned(),
+            total_size: 0,
+            mime: String::new(),
+        }))
+        .await
+        .expect("enviar el FileOffer por IPC");
+
+        // Mitad "recibir": lo que le llega al peer se reensambla.
+        let dest = workdir.join("Escritorio").join("ionconnect");
+        let mut incoming = IncomingFiles::new(dest.clone());
+        let mut got = None;
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+                .await
+                .expect("el peer debería recibir mensajes de transferencia")
+                .expect("el canal del peer no debería cerrarse");
+            match msg {
+                Message::FileOffer(o) => incoming.on_offer(o).await,
+                Message::FileChunk(c) => incoming.on_chunk(c).await,
+                Message::FileEnd(e) => {
+                    got = incoming.on_end(e).await;
+                    break;
+                }
+                Message::FileAbort(a) => panic!("transferencia abortada: {}", a.reason),
+                other => panic!("mensaje inesperado: {other:?}"),
+            }
+        }
+
+        let final_path = got.expect("la transferencia debería completarse");
+        assert_eq!(final_path, dest.join("documento.txt"));
+        assert_eq!(std::fs::read(&final_path).unwrap(), payload);
+        std::fs::remove_dir_all(&workdir).ok();
     }
 
     #[test]

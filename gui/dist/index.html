@@ -94,12 +94,24 @@
             <div class="panel__head">
               <h2 class="panel__title">Archivos</h2>
               <p class="hint">
-                Arrastrá archivos a esta ventana para enviarlos al otro equipo. Los que
-                recibís se guardan en la carpeta <code>ionconnect</code> del Escritorio.
+                Arrastrá archivos a esta ventana (o usá el botón) para enviarlos al otro
+                equipo. Los que recibís se guardan en la carpeta <code>ionconnect</code>
+                del Escritorio.
               </p>
             </div>
             <div id="file-drop" class="file-drop">Soltá archivos acá para enviarlos</div>
-            <ul id="received-files" class="received-list"></ul>
+            <button id="pick-files" class="btn btn--secondary btn--sm" type="button">
+              Seleccionar archivos…
+            </button>
+
+            <div id="sent-files-box" class="file-group" hidden>
+              <span class="file-group__label">Enviando</span>
+              <ul id="sent-files" class="transfer-list"></ul>
+            </div>
+            <div id="received-files-box" class="file-group" hidden>
+              <span class="file-group__label">Recibidos</span>
+              <ul id="received-files" class="transfer-list"></ul>
+            </div>
           </section>
         </div>
 

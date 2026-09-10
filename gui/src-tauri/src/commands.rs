@@ -12,7 +12,15 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// en una sesión larga.
 const CORE_LOG_CAPACITY: usize = 500;
 
-use crate::state::{AppState, ConnectedPeer};
+use crate::state::{AppState, ConnectedPeer, SentFile};
+
+/// Valor de un campo `clave=valor` de `tracing` que está **al final de la
+/// línea** — devuelve todo lo que sigue a `key=`, así soporta valores con
+/// espacios (nombres/rutas de archivo). Ver los `warn!/info!` de
+/// `core::file_transfer`, que ponen `name=`/`path=` último a propósito.
+fn trailing_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_once(key).map(|(_, rest)| rest.trim())
+}
 
 /// El `device_id` derivado de la identidad TLS de este equipo, en el mismo
 /// formato hexadecimal que espera `PeerConfig::device_id` — para que el
@@ -96,11 +104,18 @@ pub fn graceful_kill(child: &mut Child) {
 }
 
 /// Traduce el valor del select de nivel de registro de la GUI al filtro
-/// `RUST_LOG` que entiende `tracing`. "Todos" (`all`) = todo, incluidas las
-/// dependencias.
+/// `RUST_LOG` que entiende `tracing`. "Todos" (`all`) sube al máximo detalle
+/// **de los crates de `IonConnect`** y deja las dependencias (`rustls`,
+/// `tokio`, `mio`) en `info` — un `trace` global las convierte en una manguera.
 fn log_level_to_rust_log(level: &str) -> String {
     match level {
-        "all" | "todos" => "trace".to_string(),
+        "all" | "todos" => concat!(
+            "info,",
+            "ionconnect_core=trace,ionconnect_network=trace,ionconnect_input=trace,",
+            "ionconnect_crypto=debug,ionconnect_protocol=debug,ionconnect_ipc=trace,",
+            "ionconnect_clipboard=debug,ionconnect_config=debug,ionconnect_screen=debug"
+        )
+        .to_string(),
         "error" | "warn" | "info" | "debug" | "trace" => level.to_string(),
         _ => "info".to_string(),
     }
@@ -137,7 +152,10 @@ fn classify_line(line: &str) -> Option<&'static str> {
         Some("listening")
     } else if line.contains("reintentando conexión") {
         Some("retrying")
-    } else if line.contains("rechazado") || line.contains("no está soportado") || line.contains("ERROR") {
+    } else if line.contains("rechazado")
+        || line.contains("no está soportado")
+        || line.contains("ERROR")
+    {
         Some("error")
     } else if line.contains("identidad local cargada") {
         Some("starting")
@@ -205,18 +223,56 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
                 let _ = app.emit("core-status", status);
             }
 
-            // `archivo recibido path=<ruta>` — `path=` es el último campo de
-            // esa línea, así que el valor es todo lo que sigue (una ruta
-            // puede tener espacios, p. ej. "foo (1).png").
+            // `archivo recibido path=<ruta>` — `path=` es el último campo.
             if line.contains("archivo recibido")
-                && let Some((_, path)) = line.split_once("path=")
+                && let Some(path) = trailing_field(&line, "path=")
+                && !path.is_empty()
             {
-                let path = path.trim().to_string();
+                let path = path.to_string();
                 if let Ok(mut files) = state.core_received_files.lock()
-                    && !path.is_empty()
                     && !files.iter().any(|p| p == &path)
                 {
                     files.push(path);
+                }
+            }
+
+            // Progreso de envíos salientes — `name=` es el último campo en
+            // esas líneas de `core::file_transfer::send_file`.
+            if let Ok(mut sent) = state.core_sent_files.lock() {
+                if line.contains("enviando archivo")
+                    && let Some(name) = trailing_field(&line, "name=")
+                    && !name.is_empty()
+                {
+                    match sent.iter_mut().find(|s| s.name == name) {
+                        Some(existing) => {
+                            existing.done = false;
+                            existing.failed = false;
+                        }
+                        None => sent.push(SentFile {
+                            name: name.to_string(),
+                            done: false,
+                            failed: false,
+                        }),
+                    }
+                } else if line.contains("archivo enviado")
+                    && let Some(name) = trailing_field(&line, "name=")
+                {
+                    if let Some(existing) = sent.iter_mut().find(|s| s.name == name) {
+                        existing.done = true;
+                    }
+                } else if (line.contains("error leyendo el archivo")
+                    || line.contains("no se pudo abrir el archivo a enviar"))
+                    && let Some(name) = trailing_field(&line, "name=")
+                {
+                    if let Some(existing) = sent.iter_mut().find(|s| s.name == name) {
+                        existing.failed = true;
+                    } else {
+                        sent.push(SentFile {
+                            name: name.to_string(),
+                            done: false,
+                            failed: true,
+                        });
+                    }
                 }
             }
 
@@ -333,6 +389,12 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
         .lock()
         .expect("el lock de archivos recibidos no debería estar envenenado")
         .clear();
+
+    state
+        .core_sent_files
+        .lock()
+        .expect("el lock de archivos enviados no debería estar envenenado")
+        .clear();
     *state
         .core_status
         .lock()
@@ -342,18 +404,44 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
     Ok(())
 }
 
-/// Le pide a `ionconnect-core` (vía el canal IPC local) que mande estos
-/// archivos al otro equipo. `token_file` es `<config>/ipc.token`, que `core`
-/// publica al arrancar. Un fallo se registra y ya — no hay a quién
-/// devolvérselo desde el manejador de `DragDrop`.
-pub async fn send_files_over_ipc(token_file: std::path::PathBuf, paths: Vec<String>) {
-    let mut conn = match ionconnect_ipc::IpcClient::connect(&token_file).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("[gui] no se pudo contactar al servicio para enviar archivos: {err}");
-            return;
-        }
-    };
+/// Manda `paths` al otro equipo por el canal IPC local de `core`. Devuelve un
+/// mensaje para mostrarle al usuario (éxito o el motivo del fallo) — sin
+/// feedback, un drop que no llega a ningún lado se ve como "no funciona".
+///
+/// Precondiciones que se chequean antes de intentar el IPC:
+/// - el servicio (`ionconnect-core`) tiene que estar corriendo;
+/// - tiene que haber al menos un equipo conectado (si no, no hay a quién
+///   mandárselo y los mensajes se quedarían en un buffer sin drenar).
+async fn send_files_impl(state: &AppState, paths: Vec<String>) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err("No se seleccionó ningún archivo.".to_string());
+    }
+    if state
+        .core_child
+        .lock()
+        .expect("el lock del proceso core no debería estar envenenado")
+        .is_none()
+    {
+        return Err("El servicio no está corriendo. Tocá «Conectar» primero.".to_string());
+    }
+    let peers = state
+        .core_peers
+        .lock()
+        .expect("el lock de peers no debería estar envenenado")
+        .len();
+    if peers == 0 {
+        return Err(
+            "No hay ningún equipo conectado todavía. Esperá a que aparezca en «Equipos conectados»."
+                .to_string(),
+        );
+    }
+
+    let token_file = state.config_path.with_file_name("ipc.token");
+    let mut conn = ionconnect_ipc::IpcClient::connect(&token_file)
+        .await
+        .map_err(|e| format!("No se pudo contactar al servicio ({e})."))?;
+
+    let count = paths.len();
     for path in paths {
         let message = ionconnect_protocol::Message::FileOffer(ionconnect_protocol::FileOffer {
             transfer_id: 0,
@@ -361,20 +449,50 @@ pub async fn send_files_over_ipc(token_file: std::path::PathBuf, paths: Vec<Stri
             total_size: 0,
             mime: String::new(),
         });
-        if let Err(err) = conn.send(message).await {
-            eprintln!("[gui] fallo enviando un archivo por IPC: {err}");
-            return;
-        }
+        conn.send(message)
+            .await
+            .map_err(|e| format!("Fallo enviando un archivo ({e})."))?;
     }
+    Ok(format!(
+        "Enviando {count} archivo{} al otro equipo…",
+        if count == 1 { "" } else { "s" }
+    ))
 }
 
-/// Variante invocable desde el frontend (por si más adelante hay un botón de
-/// "enviar archivo" además del drag&drop).
+/// Mandar archivos ya elegidos (arrastrados a la ventana, o desde el picker).
 #[tauri::command]
-pub async fn send_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), String> {
-    let token_file = state.config_path.with_file_name("ipc.token");
-    send_files_over_ipc(token_file, paths).await;
-    Ok(())
+pub async fn send_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<String, String> {
+    send_files_impl(&state, paths).await
+}
+
+/// Abre el diálogo nativo de selección de archivos y manda lo elegido.
+/// Alternativa al drag&drop.
+#[tauri::command]
+pub async fn send_files_dialog(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Elegí archivos para enviar")
+        .pick_files(move |selected| {
+            let _ = tx.send(selected);
+        });
+    let selected = rx
+        .await
+        .map_err(|_| "no se pudo abrir el diálogo de archivos".to_string())?;
+    let Some(selected) = selected else {
+        return Ok("Selección cancelada.".to_string());
+    };
+    let paths: Vec<String> = selected
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .filter_map(|p| p.to_str().map(str::to_string))
+        .collect();
+    send_files_impl(&state, paths).await
 }
 
 /// El usuario confirmó en el modal que quiere cerrar. Sale de la app de
@@ -411,6 +529,12 @@ pub fn stop_core(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 .lock()
                 .expect("el lock de archivos recibidos no debería estar envenenado")
                 .clear();
+
+            state
+                .core_sent_files
+                .lock()
+                .expect("el lock de archivos enviados no debería estar envenenado")
+                .clear();
             let _ = app.emit("core-status", "stopped");
             Ok(())
         }
@@ -428,6 +552,7 @@ pub struct CoreSnapshot {
     pub status: String,
     pub log: Vec<String>,
     pub received_files: Vec<String>,
+    pub sent_files: Vec<SentFile>,
 }
 
 #[tauri::command]
@@ -452,10 +577,16 @@ pub fn get_core_snapshot(state: State<AppState>) -> CoreSnapshot {
         .lock()
         .expect("el lock de archivos recibidos no debería estar envenenado")
         .clone();
+    let sent_files = state
+        .core_sent_files
+        .lock()
+        .expect("el lock de archivos enviados no debería estar envenenado")
+        .clone();
     CoreSnapshot {
         running,
         status,
         log,
         received_files,
+        sent_files,
     }
 }

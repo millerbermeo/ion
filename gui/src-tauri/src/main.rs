@@ -5,12 +5,14 @@ mod commands;
 mod identity;
 mod state;
 
+use serde_json::json;
 use tauri::{DragDropEvent, Manager, RunEvent, WindowEvent};
 
 use state::AppState;
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_device_id,
@@ -21,6 +23,7 @@ fn main() {
             commands::stop_core,
             commands::get_core_snapshot,
             commands::send_files,
+            commands::send_files_dialog,
             commands::confirm_close,
         ])
         .on_window_event(|window, event| match event {
@@ -31,15 +34,15 @@ fn main() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 if let Some(webview) = window.app_handle().get_webview_window(window.label()) {
-                    let _ = webview.eval(
-                        "window.__ionCloseRequested && window.__ionCloseRequested()",
-                    );
+                    let _ =
+                        webview.eval("window.__ionCloseRequested && window.__ionCloseRequested()");
                 }
             }
-            // Arrastrar archivos a la ventana los manda al otro equipo. El
-            // drag&drop se maneja acá (no en el webview) para no depender de
-            // permisos de eventos en el frontend; `core` los transfiere y el
-            // otro lado los guarda en la carpeta `ionconnect` del Escritorio.
+            // Arrastrar archivos a la ventana: el drop se captura acá (el
+            // webview no lo ve con `dragDropEnabled`), y se le pasan las
+            // rutas al frontend, que llama a `send_files` y muestra el
+            // resultado como toast. `core` transfiere y el otro lado los
+            // guarda en la carpeta `ionconnect` del Escritorio.
             WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
                 let paths: Vec<String> = paths
                     .iter()
@@ -48,11 +51,13 @@ fn main() {
                 if paths.is_empty() {
                     return;
                 }
-                let token_file = window
-                    .state::<AppState>()
-                    .config_path
-                    .with_file_name("ipc.token");
-                tauri::async_runtime::spawn(commands::send_files_over_ipc(token_file, paths));
+                if let Some(webview) = window.app_handle().get_webview_window(window.label()) {
+                    let script = format!(
+                        "window.__ionFilesDropped && window.__ionFilesDropped({})",
+                        json!(paths)
+                    );
+                    let _ = webview.eval(&script);
+                }
             }
             _ => {}
         })

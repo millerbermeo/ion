@@ -26,6 +26,21 @@ pub struct AppState {
     /// Rutas de los archivos que `core` reportó como recibidos (línea de log
     /// `archivo recibido`), para mostrarlas en la GUI.
     pub core_received_files: Mutex<Vec<String>>,
+    /// Archivos que este equipo está enviando / envió, derivados de las
+    /// líneas `enviando archivo` / `archivo enviado` del log de `core` —
+    /// para mostrar un progreso ("enviando…" con spinner, luego ✓).
+    pub core_sent_files: Mutex<Vec<SentFile>>,
+}
+
+/// Estado de un envío de archivo saliente, para el indicador de progreso.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SentFile {
+    pub name: String,
+    /// `false` mientras está en curso, `true` cuando `core` logueó
+    /// `archivo enviado`.
+    pub done: bool,
+    /// `true` si `core` logueó un error de lectura para este archivo.
+    pub failed: bool,
 }
 
 /// Un equipo que `core` reportó como conectado, extraído en vivo de sus
@@ -56,6 +71,7 @@ impl AppState {
             core_status: Mutex::new("stopped".to_string()),
             core_peers: Mutex::new(Vec::new()),
             core_received_files: Mutex::new(Vec::new()),
+            core_sent_files: Mutex::new(Vec::new()),
         }
     }
 }

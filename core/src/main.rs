@@ -28,7 +28,14 @@ fn config_dir() -> PathBuf {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // `RUST_LOG` manda (lo pone la GUI según el select "Nivel de registro");
+    // si no está, INFO.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let dir = config_dir();
     if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -79,6 +86,12 @@ fn main() {
             error!(%err, "ionconnect-core terminó con error");
             std::process::exit(1);
         }
+        // Salir ya, sin dejar que `Runtime::drop` espere: la captura X11
+        // corre en un `spawn_blocking` cuyo bucle de eventos nunca retorna
+        // (no hay forma de cancelarlo desde afuera), así que dropear el
+        // runtime colgaría el proceso para siempre en un apagado limpio.
+        info!("ionconnect-core detenido");
+        std::process::exit(0);
     });
 }
 
