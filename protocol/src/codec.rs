@@ -69,6 +69,10 @@ pub fn encode_message_into(buf: &mut BytesMut, message: &Message) -> Result<(), 
         Message::Version(payload) => encode_postcard(buf, payload)?,
         Message::DisplayGeometry(payload) => encode_postcard(buf, payload)?,
         Message::UdpHello(UdpHello { port }) => buf.put_u16_le(*port),
+        Message::FileOffer(payload) => encode_postcard(buf, payload)?,
+        Message::FileChunk(payload) => encode_postcard(buf, payload)?,
+        Message::FileEnd(payload) => encode_postcard(buf, payload)?,
+        Message::FileAbort(payload) => encode_postcard(buf, payload)?,
     }
 
     Ok(())
@@ -147,6 +151,10 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, ProtocolError> {
                 port: buf.get_u16_le(),
             }))
         }
+        MessageType::FileOffer => Ok(Message::FileOffer(postcard::from_bytes(buf)?)),
+        MessageType::FileChunk => Ok(Message::FileChunk(postcard::from_bytes(buf)?)),
+        MessageType::FileEnd => Ok(Message::FileEnd(postcard::from_bytes(buf)?)),
+        MessageType::FileAbort => Ok(Message::FileAbort(postcard::from_bytes(buf)?)),
     }
 }
 
@@ -180,5 +188,11 @@ const fn estimated_capacity(message: &Message) -> usize {
         Message::Version(_) => 7,
         Message::DisplayGeometry(_) => 9,
         Message::UdpHello(_) => 3,
+        Message::FileOffer(_) => 128,
+        // Cabecera (`transfer_id` + prefijo de longitud) más el trozo en sí;
+        // el `Vec` se copia igual, esto solo evita un par de reallocs.
+        Message::FileChunk(chunk) => chunk.data.len() + 16,
+        Message::FileEnd(_) => 9,
+        Message::FileAbort(_) => 48,
     }
 }

@@ -121,6 +121,13 @@ pub async fn run_server(
         routing.clone(),
     ));
 
+    // Canal IPC local: la GUI le pide a este proceso que mande archivos a
+    // los peers conectados (ver `file_transfer::serve_ipc_file_sends`).
+    tokio::spawn(crate::file_transfer::serve_ipc_file_sends(
+        config_dir.join("ipc.token"),
+        crate::file_transfer::FileSink::Broadcast(routing.clone()),
+    ));
+
     let handoff = Arc::new(std::sync::Mutex::new(crate::handoff::HandoffState::new(
         layout,
         local_device,
@@ -362,6 +369,12 @@ async fn handle_peer_connection(
     let (tx, mut rx) = mpsc::unbounded_channel();
     routing.register(auth.device_id, tx);
 
+    // Transferencias entrantes de este peer — se van escribiendo a
+    // `~/Downloads/ionconnect/`. `transfer_id` es del emisor, así que un
+    // mapa por conexión no colisiona.
+    let mut incoming_files =
+        crate::file_transfer::IncomingFiles::new(crate::file_transfer::default_download_dir());
+
     loop {
         tokio::select! {
             incoming = conn.recv() => {
@@ -372,6 +385,12 @@ async fn handle_peer_connection(
                             let _ = guard.apply_remote_change(text);
                         }
                     }
+                    Some(Message::FileOffer(offer)) => incoming_files.on_offer(offer).await,
+                    Some(Message::FileChunk(chunk)) => incoming_files.on_chunk(chunk).await,
+                    Some(Message::FileEnd(end)) => {
+                        incoming_files.on_end(end).await;
+                    }
+                    Some(Message::FileAbort(abort)) => incoming_files.on_abort(abort).await,
                     Some(Message::DisplayGeometry(geometry)) => {
                         let effective = {
                             let mut guard = handoff
@@ -420,6 +439,7 @@ async fn handle_peer_connection(
         }
     }
 
+    incoming_files.abort_all().await;
     routing.unregister(auth.device_id);
     udp_peers.unregister(auth.device_id);
     info!(device_id = %auth.device_id, "peer desconectado");

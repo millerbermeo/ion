@@ -1932,12 +1932,15 @@ version = "0.1.0"
 dependencies = [
  "ionconnect-config",
  "ionconnect-crypto",
+ "ionconnect-ipc",
+ "ionconnect-protocol",
  "ionconnect-shared",
  "libc",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]

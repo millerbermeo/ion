@@ -1216,3 +1216,50 @@ textarea {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ==========================================================================
+   18. ARCHIVOS (drag&drop + recibidos)
+   ========================================================================== */
+
+.file-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--s-5) var(--s-4);
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--r-md);
+  color: var(--text-muted);
+  font-size: 13px;
+  background: var(--surface-2);
+}
+
+.received-list {
+  list-style: none;
+  margin: var(--s-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+
+.received-list__item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.received-list__name {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.received-list__path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  word-break: break-all;
+}

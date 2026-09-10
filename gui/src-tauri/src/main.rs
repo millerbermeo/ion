@@ -5,7 +5,7 @@ mod commands;
 mod identity;
 mod state;
 
-use tauri::{Manager, RunEvent};
+use tauri::{DragDropEvent, Manager, RunEvent, WindowEvent};
 
 use state::AppState;
 
@@ -20,7 +20,28 @@ fn main() {
             commands::start_core,
             commands::stop_core,
             commands::get_core_snapshot,
+            commands::send_files,
         ])
+        .on_window_event(|window, event| {
+            // Arrastrar archivos a la ventana los manda al otro equipo. El
+            // drag&drop se maneja acá (no en el webview) para no depender de
+            // permisos de eventos en el frontend; `core` los transfiere y el
+            // otro lado los guarda en ~/Downloads/ionconnect.
+            if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                let paths: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.to_str().map(str::to_string))
+                    .collect();
+                if paths.is_empty() {
+                    return;
+                }
+                let token_file = window
+                    .state::<AppState>()
+                    .config_path
+                    .with_file_name("ipc.token");
+                tauri::async_runtime::spawn(commands::send_files_over_ipc(token_file, paths));
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error construyendo la aplicación IonConnect");
 
@@ -32,10 +53,10 @@ fn main() {
         // así el otro equipo no queda reintentando ni con el mouse agarrado.
         if let RunEvent::Exit = event {
             let state = app_handle.state::<AppState>();
-            if let Ok(mut guard) = state.core_child.lock() {
-                if let Some(mut child) = guard.take() {
-                    commands::graceful_kill(&mut child);
-                }
+            if let Ok(mut guard) = state.core_child.lock()
+                && let Some(mut child) = guard.take()
+            {
+                commands::graceful_kill(&mut child);
             }
         }
     });

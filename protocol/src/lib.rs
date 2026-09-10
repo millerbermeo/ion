@@ -12,6 +12,6 @@ pub use codec::{decode_message, encode_message, encode_message_into};
 pub use error::ProtocolError;
 pub use message::{
     Authentication, ClipboardMime, ClipboardSync, DISCONNECT_SHUTDOWN, Disconnect, DisplayGeometry,
-    Heartbeat, KeyboardPress, KeyboardRelease, Message, MessageType, MouseButton, MouseClick,
-    MouseMove, Reconnect, UdpHello, Version,
+    FileAbort, FileChunk, FileEnd, FileOffer, Heartbeat, KeyboardPress, KeyboardRelease, Message,
+    MessageType, MouseButton, MouseClick, MouseMove, Reconnect, UdpHello, Version,
 };

@@ -175,12 +175,32 @@ function setCoreLog(lines) {
 /// Única fuente de verdad para el estado de `core`: no confiamos en que
 /// los eventos hayan llegado bien al webview, así que consultamos
 /// `get_core_snapshot` cada segundo y pintamos lo que diga el backend.
+function renderReceivedFiles(files) {
+  const list = document.getElementById("received-files");
+  if (!list) return;
+  const items = Array.isArray(files) ? files : [];
+  // Solo repintar si cambió, para no pisar el scroll.
+  const signature = items.join("\n");
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
+
+  list.innerHTML = "";
+  for (const path of items.slice().reverse()) {
+    const name = path.split("/").pop() || path;
+    const item = el("li", "received-list__item");
+    item.append(el("span", "received-list__name", name));
+    item.append(el("span", "received-list__path", path));
+    list.append(item);
+  }
+}
+
 async function pollCoreSnapshot() {
   try {
     const snapshot = await invoke()("get_core_snapshot");
     coreRunning = snapshot.running;
     setConnectionIndicator(snapshot.running ? snapshot.status : "stopped");
     setCoreLog(snapshot.log);
+    renderReceivedFiles(snapshot.received_files);
     updateCoreToggleLabel();
     await loadDevices();
   } catch {

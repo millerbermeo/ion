@@ -99,12 +99,14 @@ Cada crate tiene su propia suite de tests (unitarios + integración contra recur
 - [x] Configuración persistente + hot-reload, con rol y peers
 - [x] IPC local GUI↔core
 - [x] GUI (Tauri): rol, peers con lado de pantalla, ID propio copiable
+- [x] Transferencia de archivos (arrastrar a la ventana de la GUI → se guardan en `~/Downloads/ionconnect` del otro equipo)
+- [x] Ciclo de vida atado a la ventana: sin bandeja, cerrar la ventana apaga `core` y avisa al otro extremo con `Disconnect`
 - [x] Binario `core`: orquesta captura→red→inyección extremo a extremo (servidor X11)
 - [x] CI que publica instaladores nativos por plataforma (GitHub Actions + `tauri-action`), sin pedirle a nadie que compile
 - [ ] Servidor (captura) en Windows/Wayland — hoy solo cliente en esas plataformas
 - [ ] Intercambio real de geometría de pantalla entre equipos (hoy se asume la misma resolución)
 - [ ] Backend de captura Wayland nativo (wlroots / `ext-input-capture-v1`)
-- [ ] Transferencia de archivos, portapapeles de imágenes
+- [ ] Portapapeles de imágenes; copiar/pegar archivos desde el explorador (hoy la transferencia es solo por arrastre a la ventana)
 - [ ] Soporte macOS
 
 ## Limitaciones conocidas

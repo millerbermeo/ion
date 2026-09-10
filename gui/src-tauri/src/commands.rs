@@ -78,8 +78,10 @@ pub fn graceful_kill(child: &mut Child) {
     {
         // SAFETY: `kill(2)` con una señal válida sobre un pid que este
         // proceso creó y todavía no cosechó.
-        unsafe {
-            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
         for _ in 0..40 {
             match child.try_wait() {
@@ -192,6 +194,21 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
                 let _ = app.emit("core-status", status);
             }
 
+            // `archivo recibido path=<ruta>` — `path=` es el último campo de
+            // esa línea, así que el valor es todo lo que sigue (una ruta
+            // puede tener espacios, p. ej. "foo (1).png").
+            if line.contains("archivo recibido")
+                && let Some((_, path)) = line.split_once("path=")
+            {
+                let path = path.trim().to_string();
+                if let Ok(mut files) = state.core_received_files.lock()
+                    && !path.is_empty()
+                    && !files.iter().any(|p| p == &path)
+                {
+                    files.push(path);
+                }
+            }
+
             if let Ok(mut peers) = state.core_peers.lock() {
                 if line.contains("peer autenticado") {
                     if let (Some(device_id), Some(name)) = (
@@ -287,12 +304,52 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
         .lock()
         .expect("el lock de peers no debería estar envenenado")
         .clear();
+    state
+        .core_received_files
+        .lock()
+        .expect("el lock de archivos recibidos no debería estar envenenado")
+        .clear();
     *state
         .core_status
         .lock()
         .expect("el lock de estado no debería estar envenenado") = "starting".to_string();
     let _ = app.emit("core-status", "starting");
     *guard = Some(child);
+    Ok(())
+}
+
+/// Le pide a `ionconnect-core` (vía el canal IPC local) que mande estos
+/// archivos al otro equipo. `token_file` es `<config>/ipc.token`, que `core`
+/// publica al arrancar. Un fallo se registra y ya — no hay a quién
+/// devolvérselo desde el manejador de `DragDrop`.
+pub async fn send_files_over_ipc(token_file: std::path::PathBuf, paths: Vec<String>) {
+    let mut conn = match ionconnect_ipc::IpcClient::connect(&token_file).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("[gui] no se pudo contactar al servicio para enviar archivos: {err}");
+            return;
+        }
+    };
+    for path in paths {
+        let message = ionconnect_protocol::Message::FileOffer(ionconnect_protocol::FileOffer {
+            transfer_id: 0,
+            name: path,
+            total_size: 0,
+            mime: String::new(),
+        });
+        if let Err(err) = conn.send(message).await {
+            eprintln!("[gui] fallo enviando un archivo por IPC: {err}");
+            return;
+        }
+    }
+}
+
+/// Variante invocable desde el frontend (por si más adelante hay un botón de
+/// "enviar archivo" además del drag&drop).
+#[tauri::command]
+pub async fn send_files(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), String> {
+    let token_file = state.config_path.with_file_name("ipc.token");
+    send_files_over_ipc(token_file, paths).await;
     Ok(())
 }
 
@@ -316,6 +373,11 @@ pub fn stop_core(app: AppHandle, state: State<AppState>) -> Result<(), String> {
                 .lock()
                 .expect("el lock de peers no debería estar envenenado")
                 .clear();
+            state
+                .core_received_files
+                .lock()
+                .expect("el lock de archivos recibidos no debería estar envenenado")
+                .clear();
             let _ = app.emit("core-status", "stopped");
             Ok(())
         }
@@ -332,6 +394,7 @@ pub struct CoreSnapshot {
     pub running: bool,
     pub status: String,
     pub log: Vec<String>,
+    pub received_files: Vec<String>,
 }
 
 #[tauri::command]
@@ -351,9 +414,15 @@ pub fn get_core_snapshot(state: State<AppState>) -> CoreSnapshot {
         .lock()
         .expect("el lock del log no debería estar envenenado")
         .clone();
+    let received_files = state
+        .core_received_files
+        .lock()
+        .expect("el lock de archivos recibidos no debería estar envenenado")
+        .clone();
     CoreSnapshot {
         running,
         status,
         log,
+        received_files,
     }
 }

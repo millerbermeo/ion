@@ -1,6 +1,7 @@
 mod client;
 mod display;
 mod error;
+mod file_transfer;
 mod handoff;
 mod identity;
 #[cfg(all(unix, not(target_os = "macos")))]

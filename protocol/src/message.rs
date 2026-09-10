@@ -23,6 +23,10 @@ pub enum MessageType {
     Version = 9,
     DisplayGeometry = 10,
     UdpHello = 11,
+    FileOffer = 12,
+    FileChunk = 13,
+    FileEnd = 14,
+    FileAbort = 15,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -42,6 +46,10 @@ impl TryFrom<u8> for MessageType {
             9 => Ok(Self::Version),
             10 => Ok(Self::DisplayGeometry),
             11 => Ok(Self::UdpHello),
+            12 => Ok(Self::FileOffer),
+            13 => Ok(Self::FileChunk),
+            14 => Ok(Self::FileEnd),
+            15 => Ok(Self::FileAbort),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -188,6 +196,45 @@ pub struct DisplayGeometry {
     pub height: u32,
 }
 
+/// Anuncia el comienzo de una transferencia de archivo por el canal TCP+TLS
+/// confiable (los `FileChunk` que siguen dependen del orden, así que no
+/// pueden ir por UDP). `transfer_id` es único por emisor mientras la
+/// transferencia está viva; `name` es solo el nombre del archivo (sin ruta),
+/// el receptor lo materializa en su carpeta de descargas. `total_size` es
+/// informativo (barra de progreso); el fin real lo marca [`FileEnd`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileOffer {
+    pub transfer_id: u64,
+    pub name: String,
+    pub total_size: u64,
+    pub mime: String,
+}
+
+/// Un trozo de una transferencia en curso. Los trozos llegan en orden (TCP)
+/// y se van anexando; el tamaño lo decide el emisor (ver
+/// `core::file_transfer::CHUNK_SIZE`), siempre bastante por debajo del límite
+/// de frame del códec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub transfer_id: u64,
+    pub data: Vec<u8>,
+}
+
+/// Marca que ya se enviaron todos los trozos de `transfer_id`: el receptor
+/// cierra el archivo y lo mueve de `<nombre>.part` a su nombre definitivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEnd {
+    pub transfer_id: u64,
+}
+
+/// Aborta `transfer_id` (error de lectura en el emisor, cancelación): el
+/// receptor descarta el `.part` a medias.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileAbort {
+    pub transfer_id: u64,
+    pub reason: String,
+}
+
 /// El cliente lo manda por el canal TCP ya confiable, una vez por sesión
 /// (justo después de `DisplayGeometry`), para avisarle al servidor a qué
 /// puerto UDP local mandarle los `MouseMove` continuos — el servidor ya
@@ -213,6 +260,10 @@ pub enum Message {
     Version(Version),
     DisplayGeometry(DisplayGeometry),
     UdpHello(UdpHello),
+    FileOffer(FileOffer),
+    FileChunk(FileChunk),
+    FileEnd(FileEnd),
+    FileAbort(FileAbort),
 }
 
 impl Message {
@@ -231,6 +282,10 @@ impl Message {
             Self::Version(_) => MessageType::Version,
             Self::DisplayGeometry(_) => MessageType::DisplayGeometry,
             Self::UdpHello(_) => MessageType::UdpHello,
+            Self::FileOffer(_) => MessageType::FileOffer,
+            Self::FileChunk(_) => MessageType::FileChunk,
+            Self::FileEnd(_) => MessageType::FileEnd,
+            Self::FileAbort(_) => MessageType::FileAbort,
         }
     }
 }

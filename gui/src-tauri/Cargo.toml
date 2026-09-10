@@ -18,10 +18,13 @@ tauri-build = "2"
 [dependencies]
 ionconnect-config = { version = "0.1.0", path = "../../config" }
 ionconnect-crypto = { version = "0.1.0", path = "../../crypto" }
+ionconnect-ipc = { version = "0.1.0", path = "../../ipc" }
+ionconnect-protocol = { version = "0.1.0", path = "../../protocol" }
 ionconnect-shared = { version = "0.1.0", path = "../../shared" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tauri = { version = "2.11.5" }
+tokio = { version = "1.52.3", features = ["net", "io-util", "rt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

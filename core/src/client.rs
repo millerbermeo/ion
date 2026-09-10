@@ -21,6 +21,7 @@ use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 
 use crate::error::CoreError;
+use crate::file_transfer::{FileSink, serve_ipc_file_sends};
 use crate::identity::local_device_id;
 use crate::udp_peers::UDP_KEY_LABEL;
 
@@ -72,6 +73,15 @@ pub async fn run_client(
     // mucho una vez.
     let mut injector = create_injector(config_dir).await?;
 
+    // Canal IPC local: la GUI le pide a este proceso que mande archivos al
+    // servidor. `outgoing_rx` lo consume el bucle de sesión activo; si no hay
+    // sesión, los mensajes esperan en el buffer acotado hasta la próxima.
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(16);
+    tokio::spawn(serve_ipc_file_sends(
+        config_dir.join("ipc.token"),
+        FileSink::Channel(outgoing_tx),
+    ));
+
     let mut backoff = Backoff::new(BackoffPolicy::default());
     loop {
         let outcome = tokio::select! {
@@ -81,6 +91,7 @@ pub async fn run_client(
                 local_device,
                 address,
                 &mut injector,
+                &mut outgoing_rx,
             ) => outcome,
             // La GUI cerró su ventana (SIGTERM): terminar sin reintentar. La
             // sesión en curso se cancela al salir del `select!`; el servidor
@@ -115,6 +126,7 @@ async fn run_single_session(
     local_device: DeviceId,
     address: SocketAddr,
     injector: &mut ClientInjector,
+    outgoing_rx: &mut mpsc::Receiver<Message>,
 ) -> Result<(), CoreError> {
     let mut conn = connect_tls(address, client_config).await?;
 
@@ -170,7 +182,15 @@ async fn run_single_session(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
-    session_loop(&mut conn, injector, &clipboard, &udp_socket, &udp_key).await
+    session_loop(
+        &mut conn,
+        injector,
+        &clipboard,
+        &udp_socket,
+        &udp_key,
+        outgoing_rx,
+    )
+    .await
 }
 
 /// Resolución real del escritorio virtual de este equipo, para que el
@@ -363,9 +383,17 @@ async fn session_loop(
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
+    outgoing_rx: &mut mpsc::Receiver<Message>,
 ) -> Result<(), CoreError> {
     let (clipboard_tx, clipboard_rx) = mpsc::channel(4);
     let poller = tokio::spawn(poll_clipboard_changes(clipboard.clone(), clipboard_tx));
+
+    // Transferencias entrantes desde el servidor — se escriben a
+    // `~/Downloads/ionconnect/`. Vive por sesión; los `.part` a medias se
+    // descartan al terminar.
+    let mut incoming_files = crate::file_transfer::IncomingFiles::new(
+        crate::file_transfer::default_download_dir(),
+    );
 
     // La inyección corre como un futuro concurrente al bucle de red, no como
     // una rama del mismo `select!` (ver `injection_task` para el porqué):
@@ -390,6 +418,8 @@ async fn session_loop(
             udp_socket,
             udp_key,
             clipboard_rx,
+            outgoing_rx,
+            &mut incoming_files,
         );
         tokio::pin!(net);
         tokio::select! {
@@ -413,6 +443,7 @@ async fn session_loop(
     drop(moves_tx);
     drop(discrete_tx);
     injection.await;
+    incoming_files.abort_all().await;
     result
 }
 
@@ -544,6 +575,8 @@ async fn session_loop_inner(
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
     mut clipboard_rx: mpsc::Receiver<String>,
+    outgoing_rx: &mut mpsc::Receiver<Message>,
+    incoming_files: &mut crate::file_transfer::IncomingFiles,
 ) -> Result<(), CoreError> {
     // `None` = todavía no se aceptó ningún `MouseMove` por UDP en esta
     // sesión — el primero siempre se acepta, después se exige que la
@@ -575,9 +608,20 @@ async fn session_loop_inner(
                             let _ = guard.apply_remote_change(text);
                         }
                     }
+                    Some(Message::FileOffer(offer)) => incoming_files.on_offer(offer).await,
+                    Some(Message::FileChunk(chunk)) => incoming_files.on_chunk(chunk).await,
+                    Some(Message::FileEnd(end)) => {
+                        incoming_files.on_end(end).await;
+                    }
+                    Some(Message::FileAbort(abort)) => incoming_files.on_abort(abort).await,
                     Some(Message::Disconnect(_)) | None => return Ok(()),
                     _ => {}
                 }
+            }
+            // Archivo que la GUI local pidió enviar al servidor (ver
+            // `serve_ipc_file_sends`): sale por la misma conexión confiable.
+            Some(message) = outgoing_rx.recv() => {
+                conn.send(message).await?;
             }
             // Deltas continuos de MouseMove (ver `core::input_session` del
             // lado servidor) — pérdida/desorden es tolerable acá, por eso

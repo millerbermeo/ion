@@ -1,7 +1,7 @@
 use ionconnect_protocol::{
-    Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, Heartbeat,
-    KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick, MouseMove, Reconnect,
-    UdpHello, Version, decode_message, encode_message,
+    Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, FileAbort, FileChunk,
+    FileEnd, FileOffer, Heartbeat, KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick,
+    MouseMove, Reconnect, UdpHello, Version, decode_message, encode_message,
 };
 use ionconnect_shared::{DeviceId, KeyModifiers};
 
@@ -97,6 +97,25 @@ fn display_geometry_round_trips() {
 #[test]
 fn udp_hello_round_trips() {
     assert_round_trips(&Message::UdpHello(UdpHello { port: 51820 }));
+}
+
+#[test]
+fn file_transfer_messages_round_trip() {
+    assert_round_trips(&Message::FileOffer(FileOffer {
+        transfer_id: 0x0102_0304_0506_0708,
+        name: "informe final.pdf".to_string(),
+        total_size: 4_823_921,
+        mime: "application/pdf".to_string(),
+    }));
+    assert_round_trips(&Message::FileChunk(FileChunk {
+        transfer_id: 9,
+        data: vec![0xAB; 4096],
+    }));
+    assert_round_trips(&Message::FileEnd(FileEnd { transfer_id: 9 }));
+    assert_round_trips(&Message::FileAbort(FileAbort {
+        transfer_id: 9,
+        reason: "el archivo desapareció durante la lectura".to_string(),
+    }));
 }
 
 #[test]

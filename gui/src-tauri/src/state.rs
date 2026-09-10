@@ -23,6 +23,9 @@ pub struct AppState {
     pub core_log: Mutex<Vec<String>>,
     pub core_status: Mutex<String>,
     pub core_peers: Mutex<Vec<ConnectedPeer>>,
+    /// Rutas de los archivos que `core` reportó como recibidos (línea de log
+    /// `archivo recibido`), para mostrarlas en la GUI.
+    pub core_received_files: Mutex<Vec<String>>,
 }
 
 /// Un equipo que `core` reportó como conectado, extraído en vivo de sus
@@ -52,6 +55,7 @@ impl AppState {
             core_log: Mutex::new(Vec::new()),
             core_status: Mutex::new("stopped".to_string()),
             core_peers: Mutex::new(Vec::new()),
+            core_received_files: Mutex::new(Vec::new()),
         }
     }
 }
