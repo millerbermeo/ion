@@ -155,6 +155,12 @@ pub struct Disconnect {
     pub reason: String,
 }
 
+/// Código de [`Disconnect::code`] para un apagado voluntario del otro
+/// extremo (el usuario cerró la ventana de la GUI). El receptor debe
+/// terminar **sin reintentar** — a diferencia de una caída de red, donde sí
+/// corresponde reconectar con backoff.
+pub const DISCONNECT_SHUTDOWN: u8 = 1;
+
 /// Permite correlacionar una reconexión con la sesión previa (p. ej. tras
 /// una renegociación de claves) sin reautenticar desde cero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

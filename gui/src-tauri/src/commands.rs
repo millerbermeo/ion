@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use ionconnect_config::Settings;
 use serde::Serialize;
@@ -66,6 +67,30 @@ pub fn list_devices(state: State<AppState>) -> Vec<DeviceSummary> {
             latency_ms: None,
         })
         .collect()
+}
+
+/// Apaga `ionconnect-core` de forma ordenada: en Unix le manda SIGTERM
+/// (que `core` intercepta para avisar a los peers con `Disconnect` antes de
+/// salir) y espera hasta 2 s; si no terminó, SIGKILL. En Windows no hay
+/// SIGTERM, así que `kill()` es lo único disponible.
+pub fn graceful_kill(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` con una señal válida sobre un pid que este
+        // proceso creó y todavía no cosechó.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..40 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Ruta al binario `ionconnect-core`. Se asume instalado junto a la GUI
@@ -215,9 +240,33 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
     }
 
     let bin = core_binary_path()?;
-    let mut child = Command::new(&bin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut command = Command::new(&bin);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Si la GUI muere (cierre normal o crash), el kernel le manda SIGTERM a
+    // `core` en vez de dejarlo huérfano escuchando el puerto — la GUI es la
+    // única forma de tenerlo corriendo, así no quedan procesos de fondo.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `pre_exec` solo llama funciones async-signal-safe
+        // (`prctl`, `getppid`, `raise`).
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Carrera: si la GUI ya murió entre fork y prctl, reparent a
+                // init (pid 1) — pedir el apagado de inmediato.
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("no se pudo iniciar {}: {e}", bin.display()))?;
 
@@ -257,8 +306,7 @@ pub fn stop_core(app: AppHandle, state: State<AppState>) -> Result<(), String> {
         .expect("el lock del proceso core no debería estar envenenado");
     match guard.take() {
         Some(mut child) => {
-            child.kill().map_err(|e| e.to_string())?;
-            let _ = child.wait();
+            graceful_kill(&mut child);
             *state
                 .core_status
                 .lock()

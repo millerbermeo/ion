@@ -46,6 +46,9 @@ const IDLE_WAKEUP: Duration = Duration::from_hours(1);
 /// camino caliente.
 struct SessionState {
     held: HeldGuard,
+    /// Teclas/botones que este servidor efectivamente reenvió como
+    /// presionados al peer que tiene el control ahora — ver [`ForwardedHeld`].
+    forwarded: ForwardedHeld,
     repeater: KeyRepeater,
     /// Última posición que quedó sin mandar por el límite de tasa.
     pending_move: Option<(DeviceId, i32, i32)>,
@@ -64,6 +67,7 @@ impl SessionState {
         let past = now.checked_sub(MOUSE_SEND_INTERVAL).unwrap_or(now);
         Self {
             held: HeldGuard::default(),
+            forwarded: ForwardedHeld::default(),
             repeater: KeyRepeater::new(settings.delay, settings.interval, move |keycode| {
                 settings.repeats(keycode)
             }),
@@ -112,6 +116,26 @@ impl SessionState {
     fn on_control_changed(&mut self) {
         self.repeater.clear();
         self.pending_move = None;
+    }
+
+    /// Reenvía al peer que acaba de perder el control la liberación de todo
+    /// lo que le habíamos mandado como presionado y todavía no se soltó — si
+    /// no, queda pegado a nivel SO del cliente (un Ctrl/Shift atascado hace
+    /// que todo click/scroll/tecla siguiente se interprete como atajo). Ver
+    /// [`ForwardedHeld`].
+    fn release_forwarded_to(&mut self, device: DeviceId, routing: &Routing) {
+        let releases = self.forwarded.drain_releases();
+        if releases.is_empty() {
+            return;
+        }
+        debug!(
+            %device,
+            count = releases.len(),
+            "liberando teclas/botones mantenidos al ceder el control"
+        );
+        for message in releases {
+            routing.send_to(device, message);
+        }
     }
 
     /// Cuánto se puede dormir esperando el próximo evento capturado antes de
@@ -198,6 +222,99 @@ impl HeldGuard {
             CapturedEvent::AbsolutePosition { .. } | CapturedEvent::MouseMove { .. } => true,
         }
     }
+}
+
+/// Teclas y botones que este servidor ya reenvió al peer activo como
+/// `pressed: true` y todavía no reenvió su liberación.
+///
+/// El cliente solo libera lo que quedó a medio presionar cuando la sesión
+/// entera termina ([`crate::client`] `HeldInput::release_all`), **no** en un
+/// hand-off. Así que si el control vuelve a local (cruce de borde de
+/// regreso) con un modificador o un botón todavía mantenido, sin esto queda
+/// pegado en el cliente hasta reconectar: un Ctrl/Shift atascado convierte
+/// cada click en "abrir en ventana nueva", cada scroll en zoom y cada tecla
+/// en un atajo. En cada cambio de dueño del control se drena este conjunto
+/// mandándole al peer saliente el `pressed: false` que le falta.
+///
+/// Las variantes de scroll no se rastrean: el emisor las manda como un
+/// par press+release instantáneo y el inyector ignora el `false`, así que un
+/// release suelto no aporta nada y hasta podría interpretarse como una
+/// muesca extra.
+#[derive(Default)]
+struct ForwardedHeld {
+    keys: std::collections::HashSet<u32>,
+    buttons: std::collections::HashSet<MouseButton>,
+}
+
+impl ForwardedHeld {
+    fn track_forwarded(&mut self, event: &CapturedEvent) {
+        match *event {
+            CapturedEvent::Key {
+                keycode,
+                pressed: true,
+                ..
+            } => {
+                self.keys.insert(keycode);
+            }
+            CapturedEvent::Key {
+                keycode,
+                pressed: false,
+                ..
+            } => {
+                self.keys.remove(&keycode);
+            }
+            CapturedEvent::MouseButton {
+                button,
+                pressed: true,
+            } if !is_scroll(button) => {
+                self.buttons.insert(button);
+            }
+            CapturedEvent::MouseButton {
+                button,
+                pressed: false,
+            } => {
+                self.buttons.remove(&button);
+            }
+            _ => {}
+        }
+    }
+
+    /// Vacía el conjunto y devuelve el `pressed: false` que le falta a cada
+    /// entrada. Las coordenadas del click de release no importan (el cliente
+    /// ya tiene el cursor donde toca), van en cero.
+    fn drain_releases(&mut self) -> Vec<Message> {
+        let mut out = Vec::with_capacity(self.keys.len() + self.buttons.len());
+        for keycode in self.keys.drain() {
+            out.push(Message::KeyboardRelease(KeyboardRelease {
+                keycode,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        for button in self.buttons.drain() {
+            out.push(Message::MouseClick(MouseClick {
+                button,
+                pressed: false,
+                x: 0,
+                y: 0,
+            }));
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.buttons.clear();
+    }
+}
+
+const fn is_scroll(button: MouseButton) -> bool {
+    matches!(
+        button,
+        MouseButton::ScrollUp
+            | MouseButton::ScrollDown
+            | MouseButton::ScrollLeft
+            | MouseButton::ScrollRight
+    )
 }
 
 /// Corre la sesión de captura de entrada X11 en el hilo actual —
@@ -307,6 +424,7 @@ fn emit_due_key_repeats(
             device,
             position,
             routing,
+            &mut session.forwarded,
         );
     }
 }
@@ -359,6 +477,10 @@ fn reclaim_if_peer_gone(
         .reclaim_if_remote(device);
     if reclaimed {
         session.on_control_changed();
+        // El peer se fue: mandarle releases es inútil (no hay conexión) y su
+        // propio cliente ya libera todo al terminar la sesión. Solo se
+        // descarta el registro para no arrastrarlo si vuelve a conectar.
+        session.forwarded.clear();
         let (x, y) = position.get();
         apply_handoff_action(
             HandoffAction::ReturnLocal { x, y },
@@ -420,7 +542,7 @@ fn handle_captured_event(
                 .expect("el lock de handoff no debería estar envenenado")
                 .active();
             if let Active::Remote(device) = active {
-                forward_button_or_key(event, device, position, routing);
+                forward_button_or_key(event, device, position, routing, &mut session.forwarded);
             } else {
                 info!("botón/tecla no reenviado: control sigue local");
             }
@@ -474,11 +596,18 @@ fn handle_position_report(
         return;
     }
 
+    let previous_active = state.active();
     if let Some(action) = state.on_position(x, y) {
         drop(state);
         // Cambia el dueño del control: lo que quedara pendiente pertenece a
         // la etapa anterior y ya no corresponde mandarlo.
         session.on_control_changed();
+        // ...y el peer que lo tenía necesita el `pressed: false` de todo lo
+        // que le habíamos reenviado y sigue sin soltarse, antes de que el
+        // nuevo dueño (local u otro peer) empiece a recibir.
+        if let Active::Remote(previous_device) = previous_active {
+            session.release_forwarded_to(previous_device, routing);
+        }
         apply_handoff_action(action, handoff, control, position, routing, (x, y));
     } else if let Active::Remote(device) = state.active() {
         // Sin vecino enlazado en el borde que se acaba de cruzar (o
@@ -552,6 +681,7 @@ fn forward_button_or_key(
     device: DeviceId,
     position: &SharedPosition,
     routing: &Routing,
+    forwarded: &mut ForwardedHeld,
 ) {
     let (x, y) = position.get();
     let message = match event {
@@ -577,6 +707,7 @@ fn forward_button_or_key(
         CapturedEvent::AbsolutePosition { .. } | CapturedEvent::MouseMove { .. } => None,
     };
     if let Some(message) = message {
+        forwarded.track_forwarded(&event);
         routing.send_to(device, message);
     }
 }
@@ -647,6 +778,7 @@ pub async fn run_wayland_input_session(
                     &routing,
                     &mut session,
                     &mut current_activation,
+                    &mut session_state,
                 )
                 .await;
             }
@@ -691,6 +823,11 @@ fn emit_due_key_repeats_wayland(
         return;
     };
     while let Some(keycode) = state.repeater.tick(Instant::now()) {
+        state.forwarded.track_forwarded(&CapturedEvent::Key {
+            keycode,
+            modifiers: KeyModifiers::NONE,
+            pressed: true,
+        });
         routing.send_to(
             device,
             Message::KeyboardPress(KeyboardPress {
@@ -706,6 +843,7 @@ async fn reclaim_if_peer_gone_wayland(
     routing: &Routing,
     session: &mut WaylandCaptureSession,
     current_activation: &mut Option<u32>,
+    state: &mut SessionState,
 ) {
     let device = match handoff
         .lock()
@@ -727,6 +865,10 @@ async fn reclaim_if_peer_gone_wayland(
         .expect("el lock de handoff no debería estar envenenado")
         .reclaim_if_remote(device);
     if reclaimed {
+        state.on_control_changed();
+        // El peer se fue: sin conexión no hay a quién mandarle los releases,
+        // y su cliente ya libera todo al terminar la sesión.
+        state.forwarded.clear();
         let _ = session.release(*current_activation, None).await;
         *current_activation = None;
     }
@@ -809,7 +951,7 @@ async fn handle_wayland_input(
     current_activation: &mut Option<u32>,
     state: &mut SessionState,
 ) {
-    reclaim_if_peer_gone_wayland(handoff, routing, session, current_activation).await;
+    reclaim_if_peer_gone_wayland(handoff, routing, session, current_activation, state).await;
 
     if matches!(
         event,
@@ -858,6 +1000,10 @@ async fn handle_wayland_input(
                 drop(guard);
                 info!(x, y, "hand-off: recuperando control local");
                 state.on_control_changed();
+                // Soltar en el peer todo lo que le habíamos mandado como
+                // presionado antes de devolver el control — si no, queda
+                // pegado en el cliente (ver `ForwardedHeld`).
+                state.release_forwarded_to(device, routing);
                 let _ = session
                     .release(*current_activation, Some((f64::from(x), f64::from(y))))
                     .await;
@@ -878,6 +1024,7 @@ async fn handle_wayland_input(
         }
         CapturedEvent::MouseButton { button, pressed } => {
             info!(?button, pressed, "botón capturado (Wayland)");
+            state.forwarded.track_forwarded(&event);
             let (x, y) = session.position();
             routing.send_to(
                 device,
@@ -895,6 +1042,7 @@ async fn handle_wayland_input(
             pressed: true,
         } => {
             info!(keycode, "tecla capturada (Wayland)");
+            state.forwarded.track_forwarded(&event);
             routing.send_to(
                 device,
                 Message::KeyboardPress(KeyboardPress { keycode, modifiers }),
@@ -905,6 +1053,7 @@ async fn handle_wayland_input(
             modifiers,
             pressed: false,
         } => {
+            state.forwarded.track_forwarded(&event);
             routing.send_to(
                 device,
                 Message::KeyboardRelease(KeyboardRelease { keycode, modifiers }),
@@ -925,6 +1074,57 @@ mod tests {
             modifiers: KeyModifiers::NONE,
             pressed,
         }
+    }
+
+    fn button(button: MouseButton, pressed: bool) -> CapturedEvent {
+        CapturedEvent::MouseButton { button, pressed }
+    }
+
+    #[test]
+    fn forwarded_held_emits_the_missing_release_for_everything_still_down() {
+        let mut fwd = ForwardedHeld::default();
+        fwd.track_forwarded(&key(42, true)); // Shift
+        fwd.track_forwarded(&button(MouseButton::Left, true));
+        fwd.track_forwarded(&key(30, true));
+        fwd.track_forwarded(&key(30, false)); // esta ya se soltó
+
+        let mut releases = fwd.drain_releases();
+        releases.sort_by_key(|m| format!("{m:?}"));
+        assert_eq!(
+            releases,
+            {
+                let mut expected = vec![
+                    Message::KeyboardRelease(KeyboardRelease {
+                        keycode: 42,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    Message::MouseClick(MouseClick {
+                        button: MouseButton::Left,
+                        pressed: false,
+                        x: 0,
+                        y: 0,
+                    }),
+                ];
+                expected.sort_by_key(|m| format!("{m:?}"));
+                expected
+            },
+            "solo lo que sigue presionado, con su pressed:false"
+        );
+        assert!(
+            fwd.drain_releases().is_empty(),
+            "drenar vacía el conjunto — un segundo hand-off no re-libera"
+        );
+    }
+
+    #[test]
+    fn forwarded_held_ignores_scroll_notches() {
+        let mut fwd = ForwardedHeld::default();
+        fwd.track_forwarded(&button(MouseButton::ScrollUp, true));
+        fwd.track_forwarded(&button(MouseButton::ScrollDown, true));
+        assert!(
+            fwd.drain_releases().is_empty(),
+            "el scroll es una muesca instantánea, no algo que quede mantenido"
+        );
     }
 
     #[test]

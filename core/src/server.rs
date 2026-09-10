@@ -46,6 +46,7 @@ pub async fn run_server(
     settings: Settings,
     config_dir: &Path,
     local_display: LocalDisplay,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
     let LocalDisplay {
         geometry: local_geometry,
@@ -125,6 +126,10 @@ pub async fn run_server(
         local_device,
     )));
 
+    // Copia del `Routing` para el aviso de apagado — el resto de los clones
+    // se mueven a las tareas de captura/aceptación.
+    let shutdown_routing = routing.clone();
+
     // El accept-loop no toca nada del backend de captura, así que es
     // seguro moverlo a una tarea de fondo con `tokio::spawn` en todos los
     // casos — a diferencia de la sesión Wayland (ver más abajo), que por
@@ -147,7 +152,10 @@ pub async fn run_server(
             tracing::error!(
                 "no hay backend de captura de entrada disponible en este equipo — no va a capturar ni reenviar entrada"
             );
-            propagate_task(accept_handle).await?;
+            tokio::select! {
+                result = propagate_task(accept_handle) => result?,
+                _ = shutdown.changed() => announce_shutdown(&shutdown_routing).await,
+            }
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         crate::display::CaptureBackend::X11 => {
@@ -158,7 +166,10 @@ pub async fn run_server(
                     tracing::error!(%err, "la sesión de captura de entrada terminó con error");
                 }
             });
-            propagate_task(accept_handle).await?;
+            tokio::select! {
+                result = propagate_task(accept_handle) => result?,
+                _ = shutdown.changed() => announce_shutdown(&shutdown_routing).await,
+            }
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         crate::display::CaptureBackend::Wayland(session) => {
@@ -182,10 +193,24 @@ pub async fn run_server(
                         tracing::error!(%err, "la sesión de captura Wayland terminó con error");
                     }
                 }
+                _ = shutdown.changed() => announce_shutdown(&shutdown_routing).await,
             }
         }
     }
     Ok(())
+}
+
+/// Avisa a cada peer conectado que el servidor se apaga a propósito, para
+/// que su cliente termine sin reintentar (ver [`DISCONNECT_SHUTDOWN`]).
+/// Espera un instante a que los frames salgan antes de que `run_server`
+/// devuelva y se cierren los sockets.
+async fn announce_shutdown(routing: &Routing) {
+    info!("apagado: avisando a los peers con Disconnect");
+    routing.broadcast(&Message::Disconnect(ionconnect_protocol::Disconnect {
+        code: ionconnect_protocol::DISCONNECT_SHUTDOWN,
+        reason: "el servidor se está apagando".to_string(),
+    }));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 }
 
 async fn propagate_task(handle: tokio::task::JoinHandle<Result<(), CoreError>>) -> Result<(), CoreError> {

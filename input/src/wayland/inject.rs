@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use ashpd::desktop::PersistMode;
 use ashpd::desktop::remote_desktop::{
     Axis, DeviceType, KeyState, NotifyKeyboardKeycodeOptions, NotifyPointerAxisDiscreteOptions,
     NotifyPointerButtonOptions, NotifyPointerMotionOptions, RemoteDesktop, SelectDevicesOptions,
@@ -5,6 +8,7 @@ use ashpd::desktop::remote_desktop::{
 };
 use ashpd::desktop::{CreateSessionOptions, Session};
 use ashpd::enumflags2::BitFlags;
+use tracing::{info, warn};
 
 use ionconnect_protocol::MouseButton;
 
@@ -12,8 +16,29 @@ use crate::error::InputError;
 use crate::event::CapturedEvent;
 use crate::inject::InputInjector;
 
+/// Nombre del archivo donde se guarda el `restore_token` del portal
+/// `RemoteDesktop` — ver [`WaylandPortalInjector::connect`].
+const RESTORE_TOKEN_FILE: &str = "wayland_restore_token";
+
 fn portal_error(err: impl std::fmt::Display) -> InputError {
     InputError::Portal(err.to_string())
+}
+
+/// Guarda `token` en `path`, creando el directorio si hace falta. Un fallo
+/// se registra pero no aborta la conexión: sin token persistido el portal
+/// vuelve a pedir permiso, molesto pero no fatal.
+fn persist_restore_token(path: &Path, token: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(%err, "no se pudo crear el directorio para el restore_token del portal");
+        return;
+    }
+    if let Err(err) = std::fs::write(path, token) {
+        warn!(%err, "no se pudo guardar el restore_token del portal");
+    } else {
+        info!("restore_token del portal RemoteDesktop guardado");
+    }
 }
 
 /// Códigos de botón Linux Evdev (los que el portal `RemoteDesktop` espera:
@@ -71,37 +96,65 @@ pub struct WaylandPortalInjector {
 
 impl WaylandPortalInjector {
     /// Negocia una sesión `RemoteDesktop` con acceso a puntero y teclado.
-    /// Esto típicamente dispara un diálogo de permiso del compositor la
-    /// primera vez.
+    ///
+    /// La primera vez dispara el diálogo de permiso del compositor. A partir
+    /// de ahí se pide `persist_mode = ExplicitlyRevoked` y se guarda en
+    /// `config_dir/wayland_restore_token` el `restore_token` que devuelve el
+    /// portal; en las conexiones siguientes (reconexión de red, reinicio del
+    /// proceso) ese token se vuelve a presentar y GNOME/otros restauran el
+    /// permiso **sin volver a mostrar el diálogo**. Sin esto, cada
+    /// reconexión negociaba una sesión nueva y el usuario tenía que aceptar
+    /// el permiso una y otra vez.
     ///
     /// # Errors
     ///
     /// Devuelve [`InputError::Unsupported`] si el portal no está disponible
     /// o el usuario rechaza el permiso.
-    pub async fn connect() -> Result<Self, InputError> {
+    pub async fn connect(config_dir: &Path) -> Result<Self, InputError> {
+        let token_path = config_dir.join(RESTORE_TOKEN_FILE);
+        let saved_token = std::fs::read_to_string(&token_path)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+
         let portal = RemoteDesktop::new().await.map_err(portal_error)?;
         let session = portal
             .create_session(CreateSessionOptions::default())
             .await
             .map_err(portal_error)?;
 
+        let mut select = SelectDevicesOptions::default()
+            .set_devices(BitFlags::from(DeviceType::Pointer) | DeviceType::Keyboard)
+            .set_persist_mode(PersistMode::ExplicitlyRevoked);
+        if let Some(token) = saved_token.as_deref() {
+            select = select.set_restore_token(token);
+        }
         portal
-            .select_devices(
-                &session,
-                SelectDevicesOptions::default()
-                    .set_devices(BitFlags::from(DeviceType::Pointer) | DeviceType::Keyboard),
-            )
+            .select_devices(&session, select)
             .await
             .map_err(portal_error)?
             .response()
             .map_err(portal_error)?;
 
-        portal
+        let started = portal
             .start(&session, None, StartOptions::default())
             .await
             .map_err(portal_error)?
             .response()
             .map_err(portal_error)?;
+
+        // El compositor puede emitir un token nuevo en cada arranque; se
+        // guarda el más reciente. Si no devolvió ninguno pero ya teníamos
+        // uno, se conserva el anterior (sigue siendo válido).
+        match started.restore_token() {
+            Some(token) if saved_token.as_deref() != Some(token) => {
+                persist_restore_token(&token_path, token);
+            }
+            None if saved_token.is_some() => {
+                info!("el portal no devolvió restore_token nuevo; se conserva el guardado");
+            }
+            _ => {}
+        }
 
         Ok(Self {
             portal,

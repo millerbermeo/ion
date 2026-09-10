@@ -5,7 +5,6 @@ mod commands;
 mod identity;
 mod state;
 
-use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, RunEvent};
 
 use state::AppState;
@@ -22,24 +21,20 @@ fn main() {
             commands::stop_core,
             commands::get_core_snapshot,
         ])
-        .setup(|app| {
-            if let Some(icon) = app.default_window_icon().cloned() {
-                TrayIconBuilder::new().icon(icon).build(app)?;
-            }
-            Ok(())
-        })
         .build(tauri::generate_context!())
         .expect("error construyendo la aplicación IonConnect");
 
     app.run(|app_handle, event| {
-        // Si el usuario deja `ionconnect-core` corriendo y cierra la GUI,
-        // lo matamos acá — si no, queda huérfano escuchando el puerto.
+        // IonConnect solo funciona con la ventana abierta: no hay ícono de
+        // bandeja ni ejecución en segundo plano. Al cerrar la ventana la app
+        // sale, y acá se apaga `ionconnect-core` de forma ordenada — le llega
+        // SIGTERM, avisa a los peers con `Disconnect` y recién ahí termina,
+        // así el otro equipo no queda reintentando ni con el mouse agarrado.
         if let RunEvent::Exit = event {
             let state = app_handle.state::<AppState>();
             if let Ok(mut guard) = state.core_child.lock() {
                 if let Some(mut child) = guard.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    commands::graceful_kill(&mut child);
                 }
             }
         }

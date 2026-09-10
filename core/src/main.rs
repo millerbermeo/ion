@@ -58,9 +58,21 @@ fn main() {
 
     let runtime = tokio::runtime::Runtime::new().expect("no se pudo crear el runtime de tokio");
     runtime.block_on(async move {
+        // Apagado voluntario: la GUI manda SIGTERM al cerrar su ventana (y
+        // `PR_SET_PDEATHSIG` lo hace también si la GUI crashea). Al recibirlo
+        // se le avisa al otro extremo con `Disconnect` antes de salir, para
+        // que su cliente/servidor no quede reintentando o con el mouse
+        // agarrado. Ver `server::run_server`/`client::run_client`.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            info!("señal de apagado recibida, cerrando de forma ordenada");
+            let _ = shutdown_tx.send(true);
+        });
+
         let result = match settings.role {
-            Role::Server => run_server(settings, &dir).await,
-            Role::Client => client::run_client(settings, &dir).await,
+            Role::Server => run_server(settings, &dir, shutdown_rx).await,
+            Role::Client => client::run_client(settings, &dir, shutdown_rx).await,
         };
         if let Err(err) = result {
             error!(%err, "ionconnect-core terminó con error");
@@ -69,8 +81,33 @@ fn main() {
     });
 }
 
-async fn run_server(settings: Settings, dir: &std::path::Path) -> Result<(), CoreError> {
+/// Se completa cuando llega SIGTERM o SIGINT (Ctrl-C) en Unix, o Ctrl-C en
+/// Windows.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term =
+            signal(SignalKind::terminate()).expect("no se pudo instalar el manejador de SIGTERM");
+        let mut int =
+            signal(SignalKind::interrupt()).expect("no se pudo instalar el manejador de SIGINT");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn run_server(
+    settings: Settings,
+    dir: &std::path::Path,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), CoreError> {
     let local_display = display::detect_local_display().await;
     info!("iniciando como servidor");
-    server::run_server(settings, dir, local_display).await
+    server::run_server(settings, dir, local_display, shutdown).await
 }

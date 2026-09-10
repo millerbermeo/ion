@@ -8,8 +8,7 @@ use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_network::{
-    BackoffPolicy, Connection, UdpKey, connect_tls, connect_with_backoff, is_newer,
-    open_mouse_move,
+    Backoff, BackoffPolicy, Connection, UdpKey, connect_tls, is_newer, open_mouse_move,
 };
 use ionconnect_protocol::{
     Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton, UdpHello,
@@ -37,7 +36,11 @@ type ClientConnection = Connection<TlsStream<TcpStream>>;
 /// Devuelve [`CoreError`] si la configuración de identidad/criptografía
 /// falla al inicio (errores de conexión individuales se reintentan
 /// internamente, no se propagan).
-pub async fn run_client(settings: Settings, config_dir: &Path) -> Result<(), CoreError> {
+pub async fn run_client(
+    settings: Settings,
+    config_dir: &Path,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), CoreError> {
     let identity = crate::identity::load_or_generate_identity(config_dir)?;
     let local_device = local_device_id(&identity);
     info!(device_id = %local_device, "identidad local cargada");
@@ -60,12 +63,50 @@ pub async fn run_client(settings: Settings, config_dir: &Path) -> Result<(), Cor
         .parse()
         .map_err(|e| CoreError::Other(format!("server_address inválida: {e}")))?;
 
-    connect_with_backoff(BackoffPolicy::default(), || {
-        run_single_session(&settings, client_config.clone(), local_device, address)
-    })
-    .await;
+    // El inyector se construye **una sola vez** y se reutiliza en cada
+    // reconexión. Antes se reconstruía por sesión, y en Wayland eso implica
+    // negociar una sesión nueva del portal `RemoteDesktop` en cada hipo de
+    // red o reinicio del servidor — GNOME muestra el diálogo de permiso cada
+    // vez. Reutilizarlo (junto al `restore_token` persistido, ver
+    // `WaylandPortalInjector::connect`) hace que el permiso se pida como
+    // mucho una vez.
+    let mut injector = create_injector(config_dir).await?;
 
-    Ok(())
+    let mut backoff = Backoff::new(BackoffPolicy::default());
+    loop {
+        let outcome = tokio::select! {
+            outcome = run_single_session(
+                &settings,
+                client_config.clone(),
+                local_device,
+                address,
+                &mut injector,
+            ) => outcome,
+            // La GUI cerró su ventana (SIGTERM): terminar sin reintentar. La
+            // sesión en curso se cancela al salir del `select!`; el servidor
+            // detecta la caída del TCP y recupera el control local.
+            _ = shutdown.changed() => {
+                info!("apagado solicitado, cerrando el cliente");
+                return Ok(());
+            }
+        };
+        match outcome {
+            // Desconexión limpia (el servidor cerró o mandó `Disconnect`):
+            // no se reintenta, el cliente termina.
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let delay = backoff.next_delay();
+                warn!(%err, delay_ms = delay.as_millis(), "reintentando conexión");
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    _ = shutdown.changed() => {
+                        info!("apagado solicitado durante el backoff, cerrando el cliente");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn run_single_session(
@@ -73,6 +114,7 @@ async fn run_single_session(
     client_config: Arc<rustls::ClientConfig>,
     local_device: DeviceId,
     address: SocketAddr,
+    injector: &mut ClientInjector,
 ) -> Result<(), CoreError> {
     let mut conn = connect_tls(address, client_config).await?;
 
@@ -124,7 +166,6 @@ async fn run_single_session(
         .await?;
     info!(port = udp_port, "puerto UDP anunciado al servidor");
 
-    let injector = create_injector().await?;
     let clipboard = Arc::new(AsyncMutex::new(ClipboardWatcher::new(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
@@ -318,7 +359,7 @@ async fn poll_clipboard_changes(
 /// portapapeles de esta sesión.
 async fn session_loop(
     conn: &mut ClientConnection,
-    injector: ClientInjector,
+    injector: &mut ClientInjector,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
@@ -326,37 +367,52 @@ async fn session_loop(
     let (clipboard_tx, clipboard_rx) = mpsc::channel(4);
     let poller = tokio::spawn(poll_clipboard_changes(clipboard.clone(), clipboard_tx));
 
-    // La inyección corre en su propia tarea, desacoplada del bucle de red
-    // (ver `injection_task` para el porqué). El movimiento va por un `watch`
-    // — coalesce solo, únicamente sobrevive la posición más fresca — y lo
-    // discreto (teclas, clicks) por una cola acotada que preserva el orden.
+    // La inyección corre como un futuro concurrente al bucle de red, no como
+    // una rama del mismo `select!` (ver `injection_task` para el porqué):
+    // así, mientras una inyección espera su round trip D-Bus, el `select!`
+    // de abajo sigue puliendo el bucle de red. No se usa `tokio::spawn`
+    // para poder prestar `&mut injector` y reutilizarlo entre reconexiones
+    // sin devolverlo por valor. El movimiento va por un `watch` — coalesce
+    // solo, únicamente sobrevive la posición más fresca — y lo discreto
+    // (teclas, clicks) por una cola acotada que preserva el orden.
     let (moves_tx, moves_rx) = watch::channel(None);
     let (discrete_tx, discrete_rx) = mpsc::channel(128);
-    let injection = tokio::spawn(injection_task(injector, moves_rx, discrete_rx));
 
-    let result = session_loop_inner(
-        conn,
-        &moves_tx,
-        &discrete_tx,
-        clipboard,
-        udp_socket,
-        udp_key,
-        clipboard_rx,
-    )
-    .await;
+    let injection = injection_task(injector, moves_rx, discrete_rx);
+    tokio::pin!(injection);
+
+    let result = {
+        let net = session_loop_inner(
+            conn,
+            &moves_tx,
+            &discrete_tx,
+            clipboard,
+            udp_socket,
+            udp_key,
+            clipboard_rx,
+        );
+        tokio::pin!(net);
+        tokio::select! {
+            r = &mut net => r,
+            () = &mut injection => {
+                // `injection_task` solo termina al cerrarse los canales, y
+                // eso todavía no pasó — si llega acá es un bug interno.
+                warn!("la tarea de inyección terminó antes que el bucle de sesión");
+                Ok(())
+            }
+        }
+    };
 
     // Cada reconexión arranca su propio sondeo: sin esto se acumularía uno
     // por sesión, todos leyendo el mismo portapapeles.
     poller.abort();
-    // Cerrar los dos canales le avisa a la tarea de inyección que la sesión
-    // terminó: drena lo discreto pendiente, libera lo que quedó presionado
+    // Cerrar los dos canales le avisa a la inyección que la sesión terminó:
+    // drena lo discreto pendiente, libera lo que quedó presionado
     // (`HeldInput::release_all`) y recién ahí termina — por eso se la espera
     // antes de devolver el control al bucle de reconexión.
     drop(moves_tx);
     drop(discrete_tx);
-    if let Err(err) = injection.await {
-        warn!(%err, "la tarea de inyección terminó mal");
-    }
+    injection.await;
     result
 }
 
@@ -378,7 +434,7 @@ async fn session_loop(
 ///   inyectada: un click debe caer donde el cursor está *ahora*, no donde
 ///   estaba en la última inyección de movimiento.
 async fn injection_task(
-    mut injector: ClientInjector,
+    injector: &mut ClientInjector,
     mut moves: watch::Receiver<Option<(i32, i32)>>,
     mut discrete: mpsc::Receiver<CapturedEvent>,
 ) {
@@ -396,7 +452,7 @@ async fn injection_task(
                 let Some(event) = event else { break };
                 // Posición fresca primero — ver el comentario del doc.
                 let position = *moves.borrow_and_update();
-                inject_move_if_new(&mut injector, position, &mut last_injected).await;
+                inject_move_if_new(injector, position, &mut last_injected).await;
                 held.track(&event);
                 injector.inject(&event).await;
             }
@@ -406,7 +462,7 @@ async fn injection_task(
                         // `borrow` devuelve el más nuevo aunque haya vuelto
                         // a cambiar entre el aviso y esta lectura.
                         let position = *moves.borrow();
-                        inject_move_if_new(&mut injector, position, &mut last_injected).await;
+                        inject_move_if_new(injector, position, &mut last_injected).await;
                     }
                     // El emisor se cerró: la sesión terminó.
                     Err(_) => break,
@@ -421,7 +477,7 @@ async fn injection_task(
         held.track(&event);
         injector.inject(&event).await;
     }
-    held.release_all(&mut injector).await;
+    held.release_all(injector).await;
 }
 
 /// Inyecta `position` solo si difiere de la última ya inyectada — ver el
@@ -590,7 +646,8 @@ async fn session_loop_inner(
 /// quedarse sin inyectar solo porque `DISPLAY` no estaba puesto. Sin esta
 /// cadena, un cliente Linux que fallara en su backend preferido terminaba el
 /// proceso en vez de conectarse igual.
-async fn create_injector() -> Result<ClientInjector, CoreError> {
+#[cfg_attr(windows, allow(unused_variables))]
+async fn create_injector(config_dir: &Path) -> Result<ClientInjector, CoreError> {
     #[cfg(windows)]
     {
         return Ok(ClientInjector::Sync(Box::new(
@@ -619,7 +676,7 @@ async fn create_injector() -> Result<ClientInjector, CoreError> {
             };
             if let Some(backend) = backend {
                 info!(backend = backend.name(), "backend de inyección forzado por entorno");
-                return connect_backend(backend).await;
+                return connect_backend(backend, config_dir).await;
             }
         }
 
@@ -648,7 +705,7 @@ async fn create_injector() -> Result<ClientInjector, CoreError> {
             (Backend::X11, Backend::Wayland)
         };
 
-        let first_error = match connect_backend(first).await {
+        let first_error = match connect_backend(first, config_dir).await {
             Ok(injector) => {
                 info!(backend = first.name(), "backend de inyección listo");
                 return Ok(injector);
@@ -661,7 +718,7 @@ async fn create_injector() -> Result<ClientInjector, CoreError> {
             fallback = second.name(),
             "el backend de inyección preferido no está disponible, probando el otro"
         );
-        return match connect_backend(second).await {
+        return match connect_backend(second, config_dir).await {
             Ok(injector) => {
                 info!(backend = second.name(), "backend de inyección listo");
                 Ok(injector)
@@ -700,12 +757,15 @@ impl Backend {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-async fn connect_backend(backend: Backend) -> Result<ClientInjector, CoreError> {
+async fn connect_backend(
+    backend: Backend,
+    config_dir: &Path,
+) -> Result<ClientInjector, CoreError> {
     match backend {
         Backend::X11 => ionconnect_input::x11::X11Injector::connect()
             .map(|injector| ClientInjector::Sync(Box::new(injector)))
             .map_err(CoreError::Input),
-        Backend::Wayland => ionconnect_input::wayland::WaylandPortalInjector::connect()
+        Backend::Wayland => ionconnect_input::wayland::WaylandPortalInjector::connect(config_dir)
             .await
             .map(|injector| ClientInjector::WaylandPortal(Box::new(injector)))
             .map_err(CoreError::Input),
@@ -872,10 +932,8 @@ mod tests {
         drop(moves_tx);
         drop(discrete_tx);
 
-        let (recorder, injector) = recording();
-        tokio::spawn(injection_task(injector, moves_rx, discrete_rx))
-            .await
-            .expect("la tarea no debería entrar en panic");
+        let (recorder, mut injector) = recording();
+        injection_task(&mut injector, moves_rx, discrete_rx).await;
 
         assert_eq!(
             recorder.events(),
@@ -913,10 +971,8 @@ mod tests {
         drop(moves_tx);
         drop(discrete_tx);
 
-        let (recorder, injector) = recording();
-        tokio::spawn(injection_task(injector, moves_rx, discrete_rx))
-            .await
-            .expect("la tarea no debería entrar en panic");
+        let (recorder, mut injector) = recording();
+        injection_task(&mut injector, moves_rx, discrete_rx).await;
 
         assert_eq!(
             recorder.events(),

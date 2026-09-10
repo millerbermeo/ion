@@ -1933,6 +1933,7 @@ dependencies = [
  "ionconnect-config",
  "ionconnect-crypto",
  "ionconnect-shared",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
