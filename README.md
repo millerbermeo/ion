@@ -44,19 +44,16 @@ clonan el repositorio, compilan en modo release y dejan `ionconnect-gui` e
 1. En **cada** equipo: correr `ionconnect-gui`, copiar el "ID de este equipo" que muestra.
 2. En el equipo con el mouse/teclado físico (el **servidor**): dejar el rol en "Servidor", agregar cada otro equipo como peer pegando su ID y eligiendo de qué lado de la pantalla está (izquierda/derecha/arriba/abajo).
 3. En los demás equipos (**clientes**): cambiar el rol a "Cliente" y poner la dirección `ip:puerto` del servidor.
-4. Correr `ionconnect-core` en los equipos (servidor primero). Mover el mouse hacia el borde configurado pasa el control al equipo vecino.
+4. Tocar **Conectar** en la GUI de cada equipo (servidor primero). Mover el mouse hacia el borde configurado pasa el control al equipo vecino.
 
-### Correr en segundo plano (Linux)
-
-`install.sh` deja instalado (pero sin arrancar) un servicio systemd de usuario, así `ionconnect-core` sigue corriendo aunque cierres la GUI:
+IonConnect corre **solo mientras la ventana de la GUI está abierta**: no hay ícono de bandeja ni servicio en segundo plano. Al cerrar la ventana (con confirmación) se apaga `ionconnect-core` y se avisa al otro equipo. Si tenés una instalación vieja con el servicio systemd `ionconnect-core.service` habilitado, desactivalo — la GUI y el servicio pelean por el mismo puerto (`Address already in use`):
 
 ```bash
-systemctl --user start ionconnect-core.service    # arrancarlo ahora
-systemctl --user status ionconnect-core.service   # ver que esté corriendo
-journalctl --user -u ionconnect-core.service -f   # logs en vivo
+systemctl --user disable --now ionconnect-core.service
+rm -f ~/.config/systemd/user/ionconnect-core.service && systemctl --user daemon-reload
 ```
 
-Ya quedó habilitado para el próximo login (`enable`). Si usás el servicio, no uses el botón "Conectar" de la GUI en esa máquina — ambos compitiendo por el mismo puerto fallan.
+(`install.sh` ya hace esto solo desde esta versión.)
 
 ## Compilar manualmente
 

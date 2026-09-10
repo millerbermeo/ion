@@ -97,18 +97,19 @@ case ":$PATH:" in
   *) log "Agregá $BIN_DIR a tu PATH (por ejemplo en ~/.bashrc): export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
+# IonConnect corre SOLO mientras la ventana de la GUI está abierta (no hay
+# ejecución en segundo plano ni ícono de bandeja). Si una instalación previa
+# dejó habilitado el servicio systemd de usuario, se desactiva acá: la GUI y
+# el servicio compitiendo por el mismo puerto fallan con "Address already in
+# use".
 if command -v systemctl >/dev/null 2>&1; then
-  log "Instalando servicio systemd de usuario (corre ionconnect-core en segundo plano, sobrevive cerrar la GUI)..."
-  SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$SYSTEMD_USER_DIR"
-  install -m 644 "$INSTALL_DIR/installer/linux/ionconnect-core.service" "$SYSTEMD_USER_DIR/ionconnect-core.service"
-  systemctl --user daemon-reload
-  systemctl --user enable ionconnect-core.service
-  log "Servicio habilitado (arranca solo en el próximo login)."
-  log "Para activarlo ya: systemctl --user start ionconnect-core.service"
-  log "Ojo: si la GUI ya tiene 'ionconnect-core' corriendo (botón Conectar), cerrala antes de arrancar el servicio — los dos compitiendo por el mismo puerto fallan."
-else
-  log "systemctl no encontrado — omitiendo instalación del servicio de background. Instalación manual: ver installer/linux/ionconnect-core.service"
+  if systemctl --user list-unit-files ionconnect-core.service >/dev/null 2>&1 \
+     && systemctl --user is-enabled ionconnect-core.service >/dev/null 2>&1; then
+    log "Encontrado un servicio systemd de una instalación previa — se desactiva (IonConnect ahora corre solo con la GUI abierta)."
+    systemctl --user disable --now ionconnect-core.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$HOME/.config/systemd/user/ionconnect-core.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 
 log "Listo. Buscá 'IonConnect' en el menú de aplicaciones, o corré 'ionconnect-gui'."

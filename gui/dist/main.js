@@ -63,6 +63,7 @@ const CORE_STATUS_LABELS = {
   connected: "Conectado",
   retrying: "Reintentando conexión…",
   error: "Error — mirá la actividad",
+  port_busy: "Puerto ocupado — ya hay otro ionconnect-core (¿servicio systemd?)",
   stopped: "Detenido",
 };
 
@@ -72,6 +73,7 @@ const CORE_STATUS_CLASSES = {
   connected: "status--online",
   retrying: "status--connecting",
   error: "status--error",
+  port_busy: "status--error",
   stopped: "status--offline",
 };
 

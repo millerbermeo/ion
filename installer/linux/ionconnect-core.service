@@ -1,3 +1,9 @@
+# REFERENCIA — no lo instala `install.sh`. IonConnect corre solo con la
+# ventana de la GUI abierta (la GUI arranca/apaga `ionconnect-core`). Un
+# servicio corriendo en paralelo pelea con la GUI por el puerto de escucha
+# ("Address already in use"). Usá esto únicamente para un modo headless
+# propio, y en ese caso no toques el botón "Conectar" de la GUI.
+
 [Unit]
 Description=IonConnect core (mouse/keyboard/clipboard sharing service)
 After=network-online.target

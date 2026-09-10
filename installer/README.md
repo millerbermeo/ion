@@ -14,16 +14,12 @@ cargo tauri build
 Requiere en el sistema de build: `libwebkit2gtk-4.1-dev`,
 `libappindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`.
 
-`ionconnect-core.service` es la unit de systemd (de **usuario**, no de
-sistema — necesita la sesión gráfica) para el binario `ionconnect-core`
-(ya implementado — ver `core/`, orquesta captura→red→inyección). Instalar
-la unit con:
-
-```
-mkdir -p ~/.config/systemd/user
-cp installer/linux/ionconnect-core.service ~/.config/systemd/user/
-systemctl --user enable --now ionconnect-core.service
-```
+`ionconnect-core` (ver `core/`, orquesta captura→red→inyección) **no** se
+corre como servicio: IonConnect solo funciona con la ventana de la GUI
+abierta, que lo arranca y lo apaga. `installer/linux/ionconnect-core.service`
+queda solo como referencia para quien quiera un modo headless propio; el
+instalador ya no lo instala (y desactiva el de instalaciones viejas, porque
+GUI + servicio pelean por el mismo puerto).
 
 ## Windows (`.msi` / `.exe`)
 
@@ -38,5 +34,4 @@ mismo límite que los backends `win32` de `input`.
 
 - Firma de código para el instalador de Windows (fase de release, no de
   desarrollo).
-- Un `.desktop` file y entrada de autostart para Linux, análogo a la unit
-  de systemd, si se prefiere autostart de sesión en vez de servicio.
+- (El `.desktop` file ya lo instala `install.sh`.)

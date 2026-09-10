@@ -152,6 +152,10 @@ fn classify_line(line: &str) -> Option<&'static str> {
         Some("listening")
     } else if line.contains("reintentando conexión") {
         Some("retrying")
+    } else if line.contains("Address already in use") || line.contains("address in use") {
+        // Otro `ionconnect-core` (servicio systemd viejo, o instancia
+        // manual) ya tiene el puerto. La GUI muestra un texto accionable.
+        Some("port_busy")
     } else if line.contains("rechazado")
         || line.contains("no está soportado")
         || line.contains("ERROR")
