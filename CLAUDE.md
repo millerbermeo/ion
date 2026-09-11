@@ -105,3 +105,17 @@ Peer screen geometry is assumed equal to the local machine's until the peer repo
 ### Platform-conditional compilation
 
 Non-macOS Unix (`input_session`, X11/Wayland capture+inject) is gated behind `#[cfg(all(unix, not(target_os = "macos")))]`; Windows-only paths behind `#[cfg(windows)]`. When touching `core/src/client.rs` or `server.rs`, check both branches compile — there's no macOS backend at all currently.
+
+### `gui`: lifecycle is tied to the window, not a background service
+
+`gui/src-tauri/src/main.rs` spawns `ionconnect-core` as a child process (`commands::start_core`/`state::AppState`) — there is **no tray icon and no background daemon**. `WindowEvent::CloseRequested` is vetoed and forwarded to the frontend as a JS confirmation instead of closing immediately; only after the user confirms does `confirm_close` let the app exit. On `RunEvent::Exit`, the GUI sends the `core` child a graceful kill (SIGTERM equivalent) so it has time to broadcast `Disconnect` to peers and release input — killing `core` abruptly leaves the peer stuck retrying or with the mouse grabbed. Because of this, a leftover systemd user service (`ionconnect-core.service`) fights the GUI for the same listen port (`Address already in use`); `install.sh` disables it automatically, but older installs need `systemctl --user disable --now ionconnect-core.service` by hand (see `README.md`).
+
+Drag-and-drop is also handled at the Tauri window level (`WindowEvent::DragDrop`), not in the webview, and forwarded to the frontend as dropped file paths.
+
+### File transfer
+
+Files are sent over the same reliable TCP+TLS channel as clicks/keys (not UDP): `FileOffer` → `FileChunk`* → `FileEnd` (or `FileAbort` on a read failure), implemented in `core/src/file_transfer.rs`. There's no separate flow-control — the bounded `mpsc` that messages go out through already backpressures the sender, and TCP guarantees order/delivery. Chunks (`CHUNK_SIZE`, 128 KiB) are written to `<name>.<id>.part` in the receiver's downloads folder and renamed to their final name (without clobbering an existing file) once `FileEnd` arrives. The destination is always `default_transfer_dir()` — an `ionconnect` folder on the receiving user's **Desktop**, resolved OS-agnostically via `dirs::desktop_dir()` (falls back to `~/Desktop`, then cwd) — created on `core` startup and on first receipt. Initiated by dragging files onto the GUI window; there's no file-picker on the receiving end (see README roadmap for clipboard-image/explorer-copy support, not yet implemented).
+
+### Installers and packaging
+
+`.github/workflows/release.yml` builds native installers per platform via `tauri-action` (Windows `.exe`/`.msi`, Linux `.deb`/`.AppImage`) plus a standalone `ionconnect-core` binary, triggered by pushing a `vX.Y.Z` tag — end users need no Rust/build toolchain. `install.sh` (Ubuntu/Debian) and `install.ps1` (Windows) are the from-source path: they install Rust if missing, clone, `cargo build --release`, and put both binaries on `PATH`. `installer/linux/ionconnect-core.service` is a legacy systemd unit kept for reference/cleanup only — see the lifecycle note above for why it must stay disabled.
