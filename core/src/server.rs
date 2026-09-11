@@ -377,10 +377,20 @@ async fn handle_peer_connection(
     let mut incoming_files =
         crate::file_transfer::IncomingFiles::new(crate::file_transfer::default_transfer_dir());
 
-    loop {
+    // El resultado se captura en vez de propagar con `?` directo: si se
+    // devolviera temprano en un error de red (p. ej. el peer cerró sin
+    // `close_notify` de TLS, o un RST), el `unregister`/log de más abajo
+    // nunca correrían y el peer quedaría fantasma en `Routing`/`UdpPeers` —
+    // visible como "conectado" en la GUI para siempre. Con esto, cualquier
+    // desconexión (limpia o por error) pasa por el mismo cleanup.
+    let session_result: Result<(), CoreError> = 'session: loop {
         tokio::select! {
             incoming = conn.recv() => {
-                match incoming? {
+                let incoming = match incoming {
+                    Ok(v) => v,
+                    Err(err) => break 'session Err(err.into()),
+                };
+                match incoming {
                     Some(Message::ClipboardSync(sync)) => {
                         if let Ok(text) = String::from_utf8(sync.data) {
                             let mut guard = clipboard.lock().await;
@@ -431,21 +441,23 @@ async fn handle_peer_connection(
                         );
                         udp_peers.register(auth.device_id, addr, udp_key.clone());
                     }
-                    Some(Message::Disconnect(_)) | None => break,
+                    Some(Message::Disconnect(_)) | None => break 'session Ok(()),
                     _ => {}
                 }
             }
             Some(outgoing) = rx.recv() => {
-                conn.send(outgoing).await?;
+                if let Err(err) = conn.send(outgoing).await {
+                    break 'session Err(err.into());
+                }
             }
         }
-    }
+    };
 
     incoming_files.abort_all().await;
     routing.unregister(auth.device_id);
     udp_peers.unregister(auth.device_id);
     info!(device_id = %auth.device_id, "peer desconectado");
-    Ok(())
+    session_result
 }
 
 /// Cada lectura va a un hilo bloqueante porque leer el portapapeles es una

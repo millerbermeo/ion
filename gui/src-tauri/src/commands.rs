@@ -329,6 +329,41 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
 
             let _ = app.emit("core-log", &line);
         }
+
+        // El lector se queda sin líneas cuando `core` cierra su stdout/stderr
+        // — casi siempre porque el proceso terminó solo (recibió `Disconnect`
+        // del otro lado, o el peer se cayó y `core` lo dio por perdido) sin
+        // que la GUI lo haya pedido con `stop_core`. Sin esto, `core_child`
+        // seguía marcado como `Some` y la lista de "Equipos conectados"
+        // quedaba con un peer fantasma: `get_core_snapshot`/`list_devices`
+        // no tenían forma de notar que el proceso ya no está. Ambos hilos
+        // (stdout y stderr) llegan acá cuando el proceso muere; se confirma
+        // con `try_wait` (no basta con "se cerró el pipe") y solo el primero
+        // en tomar `core_child` limpia el estado.
+        let state = app.state::<AppState>();
+        let mut guard = state
+            .core_child
+            .lock()
+            .expect("el lock del proceso core no debería estar envenenado");
+        let Some(child) = guard.as_mut() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        guard.take();
+        drop(guard);
+
+        *state
+            .core_status
+            .lock()
+            .expect("el lock de estado no debería estar envenenado") = "stopped".to_string();
+        state
+            .core_peers
+            .lock()
+            .expect("el lock de peers no debería estar envenenado")
+            .clear();
+        let _ = app.emit("core-status", "stopped");
     });
 }
 
