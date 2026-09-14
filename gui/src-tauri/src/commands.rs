@@ -148,7 +148,7 @@ fn core_binary_path() -> Result<PathBuf, String> {
 fn classify_line(line: &str) -> Option<&'static str> {
     if line.contains("conectado al servidor") || line.contains("peer autenticado") {
         Some("connected")
-    } else if line.contains("escuchando conexiones de peers") {
+    } else if line.contains("escuchando conexiones de peers") || line.contains("peer desconectado") {
         Some("listening")
     } else if line.contains("reintentando conexión") {
         Some("retrying")
