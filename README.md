@@ -122,6 +122,7 @@ Hay tres formas, y ninguna de las dos primeras necesita abrir la ventana de IonC
 
 Detalles que conviene saber:
 
+- Arrastrar archivos **desde** un equipo con sesión Wayland hacia el otro no funciona con gestores de archivos Wayland nativos (Nautilus, Dolphin…): ese arrastre no pasa por el servidor X y IonConnect no puede verlo. Solución: iniciar sesión en «Ubuntu en Xorg», o abrir el gestor con `GDK_BACKEND=x11 nautilus`. Copiar y pegar (Ctrl+C / Ctrl+V) funciona igual en ambos.
 - Dentro de la carpeta `ionconnect` lo recibido se ordena solo por tipo: `Imágenes`, `Videos`, `Audios`, `Documentos`, `Comprimidos`, `Instaladores`, `Carpetas` (carpetas enteras) y `Otros`.
 - Mientras se transfiere aparece un aviso flotante arriba a la derecha con el progreso, y luego si salió bien o falló.
 - Al copiar no se transfiere nada: los archivos viajan cuando el cursor cruza al otro equipo. Con archivos grandes, el Ctrl+V puede tardar un momento en estar disponible.

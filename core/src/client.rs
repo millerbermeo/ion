@@ -645,10 +645,23 @@ enum Discrete {
 /// es la liberación del botón y no debe inyectarse antes de saber si había
 /// que cancelar el arrastre.
 async fn send_dragged_files(outgoing: &mpsc::Sender<Message>) {
+    info!("el servidor pregunta si hay un arrastre de archivos en curso");
     let paths = tokio::task::spawn_blocking(take_dragged_files)
         .await
         .unwrap_or_default();
     if paths.is_empty() {
+        // Sin esto el fallo es mudo. Bajo Wayland, el gestor de archivos
+        // nativo (Nautilus, Dolphin…) no habla XDND: su arrastre no pasa por
+        // el servidor X y no hay forma de verlo desde acá.
+        if std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland") {
+            warn!(
+                "no se detectó ningún arrastre de archivos. Esta sesión es Wayland: los \
+                 arrastres entre apps Wayland nativas no se pueden ver — iniciá sesión en \
+                 «Ubuntu en Xorg» o abrí el gestor de archivos con GDK_BACKEND=x11"
+            );
+        } else {
+            info!("no se detectó ningún arrastre de archivos en este equipo");
+        }
         return;
     }
     info!(count = paths.len(), "enviando archivos arrastrados al servidor");

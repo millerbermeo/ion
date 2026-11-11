@@ -11,7 +11,31 @@ use tauri::{DragDropEvent, Manager, RunEvent, WindowEvent};
 
 use state::AppState;
 
+/// Bajo Wayland el compositor decide dónde va cada ventana y no deja
+/// posicionarlas: el aviso de transferencias aparecía en el centro de la
+/// pantalla en vez de arriba a la derecha. Pasando GTK a X11 (XWayland) la
+/// posición se respeta. El costo es que la ventana principal también corre
+/// sobre XWayland (puede verse algo menos nítida con escalado fraccionario);
+/// `IONCONNECT_NATIVE_WAYLAND=1` lo evita a cambio de perder el posicionado.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn prefer_x11_backend() {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland");
+    if wayland
+        && std::env::var_os("GDK_BACKEND").is_none()
+        && std::env::var_os("IONCONNECT_NATIVE_WAYLAND").is_none()
+        && std::env::var_os("DISPLAY").is_some()
+    {
+        // SAFETY: es lo primero que corre `main`, antes de crear hilos o
+        // inicializar GTK, así que nadie más lee el entorno a la vez.
+        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+    }
+}
+
 fn main() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    prefer_x11_backend();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
