@@ -283,13 +283,13 @@ fieldset {
   flex: 1;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  /* Ocupa todo el ancho de la ventana: la columna lateral crece un poco con
+     pantallas grandes y la configuración se queda con el resto. */
+  grid-template-columns: clamp(300px, 28vw, 440px) minmax(0, 1fr);
   gap: var(--s-5);
   align-items: start;
   padding: var(--s-5);
-  max-width: 1240px;
   width: 100%;
-  margin: 0 auto;
 }
 
 .content__col {
