@@ -1,4 +1,5 @@
 use ionconnect_protocol::{
+    ClipboardFilesOffer, ClipboardFilesRequest, FileBatch, FileBatchEnd, FileBatchKind,
     Authentication, ClipboardMime, ClipboardSync, Disconnect, DisplayGeometry, FileAbort, FileChunk,
     FileEnd, FileOffer, Heartbeat, KeyboardPress, KeyboardRelease, Message, MouseButton, MouseClick,
     MouseMove, Reconnect, UdpHello, Version, decode_message, encode_message,
@@ -106,7 +107,19 @@ fn file_transfer_messages_round_trip() {
         name: "informe final.pdf".to_string(),
         total_size: 4_823_921,
         mime: "application/pdf".to_string(),
+        batch: None,
     }));
+    assert_round_trips(&Message::FileOffer(FileOffer {
+        transfer_id: 10,
+        name: "fotos/2024/playa.png".to_string(),
+        total_size: 12,
+        mime: "image/png".to_string(),
+        batch: Some(FileBatch {
+            id: 3,
+            kind: FileBatchKind::Clipboard,
+        }),
+    }));
+    assert_round_trips(&Message::FileBatchEnd(FileBatchEnd { id: 3 }));
     assert_round_trips(&Message::FileChunk(FileChunk {
         transfer_id: 9,
         data: vec![0xAB; 4096],
@@ -116,6 +129,18 @@ fn file_transfer_messages_round_trip() {
         transfer_id: 9,
         reason: "el archivo desapareció durante la lectura".to_string(),
     }));
+}
+
+#[test]
+fn clipboard_files_and_drag_messages_round_trip() {
+    assert_round_trips(&Message::ClipboardFilesOffer(ClipboardFilesOffer {
+        set_id: 77,
+        file_count: 4,
+    }));
+    assert_round_trips(&Message::ClipboardFilesRequest(ClipboardFilesRequest {
+        set_id: 77,
+    }));
+    assert_round_trips(&Message::DragQuery);
 }
 
 #[test]

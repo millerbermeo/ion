@@ -27,6 +27,10 @@ pub enum MessageType {
     FileChunk = 13,
     FileEnd = 14,
     FileAbort = 15,
+    FileBatchEnd = 16,
+    ClipboardFilesOffer = 17,
+    ClipboardFilesRequest = 18,
+    DragQuery = 19,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -50,6 +54,10 @@ impl TryFrom<u8> for MessageType {
             13 => Ok(Self::FileChunk),
             14 => Ok(Self::FileEnd),
             15 => Ok(Self::FileAbort),
+            16 => Ok(Self::FileBatchEnd),
+            17 => Ok(Self::ClipboardFilesOffer),
+            18 => Ok(Self::ClipboardFilesRequest),
+            19 => Ok(Self::DragQuery),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -199,15 +207,75 @@ pub struct DisplayGeometry {
 /// Anuncia el comienzo de una transferencia de archivo por el canal TCP+TLS
 /// confiable (los `FileChunk` que siguen dependen del orden, así que no
 /// pueden ir por UDP). `transfer_id` es único por emisor mientras la
-/// transferencia está viva; `name` es solo el nombre del archivo (sin ruta),
-/// el receptor lo materializa en su carpeta de descargas. `total_size` es
-/// informativo (barra de progreso); el fin real lo marca [`FileEnd`].
+/// transferencia está viva. `name` es el nombre del archivo o, dentro de un
+/// lote que incluye carpetas, su ruta **relativa** con `/` como separador
+/// (`fotos/2024/a.png`) — nunca absoluta; el receptor la sanea componente por
+/// componente antes de materializarla. `total_size` es informativo (barra de
+/// progreso); el fin real lo marca [`FileEnd`]. Un `mime` igual a
+/// [`MIME_DIRECTORY`] anuncia una carpeta (posiblemente vacía): no lleva
+/// trozos ni `FileEnd`, el receptor solo la crea.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileOffer {
     pub transfer_id: u64,
     pub name: String,
     pub total_size: u64,
     pub mime: String,
+    /// Lote al que pertenece, si es parte de uno — ver [`FileBatch`].
+    /// `None` = archivo suelto a la carpeta de transferencias (el envío
+    /// clásico desde la GUI).
+    pub batch: Option<FileBatch>,
+}
+
+/// `mime` de un [`FileOffer`] que representa una carpeta en vez de un archivo.
+pub const MIME_DIRECTORY: &str = "inode/directory";
+
+/// Qué hace el receptor con los archivos de un lote una vez que llegó entero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileBatchKind {
+    /// Quedan en la carpeta de transferencias (`<Escritorio>/ionconnect`):
+    /// archivos arrastrados con el mouse de un equipo al otro.
+    Downloads,
+    /// Van a una carpeta de caché y se publican en el portapapeles del
+    /// receptor como lista de archivos, para que un Ctrl+V los pegue donde
+    /// el usuario quiera: archivos copiados con Ctrl+C en el otro equipo.
+    Clipboard,
+}
+
+/// Agrupa varios [`FileOffer`] que el usuario movió como una sola acción
+/// (una selección de archivos y/o carpetas). El lote termina con
+/// [`FileBatchEnd`]. `id` es único por emisor mientras el lote está vivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBatch {
+    pub id: u64,
+    pub kind: FileBatchKind,
+}
+
+/// Cierra el lote `id`: ya se mandaron todos sus archivos. Para un lote
+/// [`FileBatchKind::Clipboard`] es la señal de publicar lo recibido en el
+/// portapapeles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileBatchEnd {
+    pub id: u64,
+}
+
+/// El cliente avisa al servidor que su usuario copió archivos (Ctrl+C en el
+/// explorador). Solo metadatos: los bytes no viajan hasta que el servidor los
+/// pida con [`ClipboardFilesRequest`] — cuando el cursor vuelve a su pantalla
+/// — para no transferir en cada Ctrl+C algo que quizá nunca se pegue del otro
+/// lado. `set_id == 0` retira la oferta (el portapapeles ya no tiene
+/// archivos).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFilesOffer {
+    pub set_id: u64,
+    pub file_count: u32,
+}
+
+/// El servidor le pide al cliente los archivos que anunció con
+/// [`ClipboardFilesOffer`]: el cliente responde con un lote
+/// [`FileBatchKind::Clipboard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFilesRequest {
+    pub set_id: u64,
 }
 
 /// Un trozo de una transferencia en curso. Los trozos llegan en orden (TCP)
@@ -264,6 +332,14 @@ pub enum Message {
     FileChunk(FileChunk),
     FileEnd(FileEnd),
     FileAbort(FileAbort),
+    FileBatchEnd(FileBatchEnd),
+    ClipboardFilesOffer(ClipboardFilesOffer),
+    ClipboardFilesRequest(ClipboardFilesRequest),
+    /// El servidor avisa al cliente que el cursor está saliendo de su
+    /// pantalla con el botón izquierdo mantenido: si hay un arrastre de
+    /// archivos en curso, el cliente lo cancela y manda esos archivos como
+    /// un lote [`FileBatchKind::Downloads`]. Sin payload.
+    DragQuery,
 }
 
 impl Message {
@@ -286,6 +362,10 @@ impl Message {
             Self::FileChunk(_) => MessageType::FileChunk,
             Self::FileEnd(_) => MessageType::FileEnd,
             Self::FileAbort(_) => MessageType::FileAbort,
+            Self::FileBatchEnd(_) => MessageType::FileBatchEnd,
+            Self::ClipboardFilesOffer(_) => MessageType::ClipboardFilesOffer,
+            Self::ClipboardFilesRequest(_) => MessageType::ClipboardFilesRequest,
+            Self::DragQuery => MessageType::DragQuery,
         }
     }
 }

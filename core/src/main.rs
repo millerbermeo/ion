@@ -1,4 +1,5 @@
 mod client;
+mod clipboard_files;
 mod display;
 mod error;
 mod file_transfer;

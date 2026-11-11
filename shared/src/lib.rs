@@ -2,6 +2,7 @@
 
 mod device_id;
 mod modifiers;
+pub mod uri;
 
 pub use device_id::DeviceId;
 pub use modifiers::KeyModifiers;

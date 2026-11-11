@@ -507,6 +507,7 @@ async fn send_files_impl(state: &AppState, paths: Vec<String>) -> Result<String,
             name: path,
             total_size: 0,
             mime: String::new(),
+            batch: None,
         });
         conn.send(message)
             .await

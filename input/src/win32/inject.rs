@@ -31,8 +31,8 @@ impl WindowsInjector {
 }
 
 /// Origen y tamaño del escritorio virtual completo (todos los monitores) —
-/// lo que usa `normalize_absolute` para mapear coordenadas a la escala
-/// `MOUSEEVENTF_ABSOLUTE`, y lo que reporta este equipo como cliente al
+/// el tamaño es lo que usa `normalize_absolute` para mapear coordenadas a la
+/// escala `MOUSEEVENTF_ABSOLUTE`, y lo que reporta este equipo como cliente al
 /// conectarse (ver `core::client`) para que el servidor deje de asumir
 /// que tiene su misma resolución.
 #[must_use]
@@ -47,14 +47,25 @@ pub fn virtual_screen_geometry() -> (i32, i32, i32, i32) {
     }
 }
 
-/// Convierte una coordenada absoluta de pantalla a la escala 0..=65535 que
-/// `MOUSEEVENTF_ABSOLUTE` espera, relativa al escritorio virtual completo
-/// (multi-monitor incluido).
-fn normalize_absolute(value: i32, origin: i32, extent: i32) -> i32 {
+/// Convierte una coordenada a la escala 0..=65535 que
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` espera.
+///
+/// `offset` ya es relativo a la esquina superior izquierda del escritorio
+/// virtual, **no** una coordenada de pantalla de Windows: el servidor solo
+/// conoce el ancho/alto que reportamos (`DisplayGeometry`) y modela nuestro
+/// escritorio como `0..width`. En Windows ese escritorio empieza en
+/// coordenadas negativas cuando hay monitores a la izquierda o arriba del
+/// principal (p. ej. `x = -1920`). Antes se restaba ese origen otra vez, así
+/// que todo quedaba corrido: el cursor entraba en el monitor principal en vez
+/// del borde real, el monitor de la izquierda era inalcanzable y el borde de
+/// vuelta al servidor quedaba en el medio. Solo funcionaba con el principal
+/// a la izquierda (origen 0).
+fn normalize_absolute(offset: i32, extent: i32) -> i32 {
     if extent <= 0 {
         return 0;
     }
-    (((value - origin) as i64 * 65535) / i64::from(extent)) as i32
+    let offset = offset.clamp(0, extent - 1);
+    ((i64::from(offset) * 65535) / i64::from(extent)) as i32
 }
 
 fn send_mouse(
@@ -119,9 +130,9 @@ impl InputInjector for WindowsInjector {
             // Solo tiene sentido del lado de captura; no hay nada que inyectar.
             CapturedEvent::AbsolutePosition { .. } => Ok(()),
             CapturedEvent::MouseMove { x, y } => {
-                let (origin_x, origin_y, width, height) = virtual_screen_geometry();
-                let dx = normalize_absolute(x, origin_x, width);
-                let dy = normalize_absolute(y, origin_y, height);
+                let (_, _, width, height) = virtual_screen_geometry();
+                let dx = normalize_absolute(x, width);
+                let dy = normalize_absolute(y, height);
                 send_mouse(
                     dx,
                     dy,
@@ -195,5 +206,25 @@ impl InputInjector for WindowsInjector {
                 send_key(vk.0, !pressed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_absolute;
+
+    #[test]
+    fn normalize_is_relative_to_virtual_desktop_origin() {
+        // Escritorio de 3840px (monitor a la izquierda del principal): el
+        // servidor manda 0..3840, sin importar que Windows lo ubique en -1920.
+        assert_eq!(normalize_absolute(0, 3840), 0);
+        assert_eq!(normalize_absolute(1920, 3840), 32767);
+        assert!(normalize_absolute(3839, 3840) > 65500);
+    }
+
+    #[test]
+    fn normalize_clamps_out_of_range() {
+        assert_eq!(normalize_absolute(-50, 1920), 0);
+        assert_eq!(normalize_absolute(5000, 1920), normalize_absolute(1919, 1920));
     }
 }

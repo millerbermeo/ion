@@ -11,7 +11,9 @@ mod message;
 pub use codec::{decode_message, encode_message, encode_message_into};
 pub use error::ProtocolError;
 pub use message::{
-    Authentication, ClipboardMime, ClipboardSync, DISCONNECT_SHUTDOWN, Disconnect, DisplayGeometry,
-    FileAbort, FileChunk, FileEnd, FileOffer, Heartbeat, KeyboardPress, KeyboardRelease, Message,
-    MessageType, MouseButton, MouseClick, MouseMove, Reconnect, UdpHello, Version,
+    Authentication, ClipboardFilesOffer, ClipboardFilesRequest, ClipboardMime, ClipboardSync,
+    DISCONNECT_SHUTDOWN, Disconnect, DisplayGeometry, FileAbort, FileBatch, FileBatchEnd,
+    FileBatchKind, FileChunk, FileEnd, FileOffer, Heartbeat, KeyboardPress, KeyboardRelease,
+    MIME_DIRECTORY, Message, MessageType, MouseButton, MouseClick, MouseMove, Reconnect, UdpHello,
+    Version,
 };

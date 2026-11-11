@@ -9,7 +9,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+ionconnect-shared = { version = "0.1.0", path = "../shared" }
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["time", "sync", "macros", "rt"] }
 tracing = "0.1.44"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = "0.13"

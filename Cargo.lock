@@ -1874,9 +1874,11 @@ name = "ionconnect-clipboard"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "ionconnect-shared",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "x11rb",
 ]
 
 [[package]]

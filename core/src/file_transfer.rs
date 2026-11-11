@@ -2,11 +2,20 @@
 //!
 //! Un archivo se manda como `FileOffer` → `FileChunk`* → `FileEnd` (o
 //! `FileAbort` si la lectura falla a mitad). El receptor va anexando cada
-//! trozo a `<nombre>.<id>.part` dentro de su carpeta de descargas y, al
-//! recibir `FileEnd`, lo mueve a su nombre definitivo (evitando pisar uno ya
-//! existente). No hay control de flujo propio: el `mpsc` acotado por el que
-//! salen los mensajes ya frena al emisor si la red no da abasto, y TCP
-//! garantiza orden y entrega.
+//! trozo a `<nombre>.<id>.part` y, al recibir `FileEnd`, lo mueve a su nombre
+//! definitivo (evitando pisar uno ya existente). No hay control de flujo
+//! propio: el `mpsc` acotado por el que salen los mensajes ya frena al emisor
+//! si la red no da abasto, y TCP garantiza orden y entrega.
+//!
+//! Varios archivos y/o carpetas movidos en una sola acción viajan como un
+//! **lote** ([`FileBatch`]): cada `FileOffer` lleva el id del lote y su ruta
+//! relativa, y un `FileBatchEnd` lo cierra. El tipo de lote decide el
+//! destino:
+//! - [`FileBatchKind::Downloads`] — arrastre con el mouse de un equipo al
+//!   otro: queda en `<Escritorio>/ionconnect`.
+//! - [`FileBatchKind::Clipboard`] — Ctrl+C de archivos: va a una carpeta de
+//!   caché y, al cerrarse el lote, quien lo recibe lo publica en su
+//!   portapapeles para que Ctrl+V lo pegue donde el usuario quiera.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ionconnect_ipc::IpcServer;
-use ionconnect_protocol::{FileAbort, FileChunk, FileEnd, FileOffer, Message};
+use ionconnect_protocol::{
+    FileAbort, FileBatch, FileBatchEnd, FileBatchKind, FileChunk, FileEnd, FileOffer,
+    MIME_DIRECTORY, Message,
+};
+use ionconnect_shared::DeviceId;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -27,10 +40,28 @@ use crate::routing::Routing;
 /// sobra.
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Id de lote, mismo criterio que [`NEXT_TRANSFER_ID`].
+static NEXT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Tamaño de cada `FileChunk`. Bien por debajo del límite de frame del códec
 /// (1 `MiB`) para dejar lugar a la cabecera `postcard`, y chico como para no
 /// monopolizar la conexión frente al mouse/teclado.
 pub const CHUNK_SIZE: usize = 128 * 1024;
+
+/// Tope de lo que se transfiere **solo** por haber copiado o arrastrado algo
+/// (no aplica al envío explícito desde la GUI). Un Ctrl+C distraído sobre
+/// una carpeta enorme no debería saturar la red ni llenar el disco del otro
+/// equipo sin que nadie lo haya pedido.
+pub const AUTO_TRANSFER_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Tope de entradas (archivos + carpetas) de un lote automático — mismo
+/// motivo que [`AUTO_TRANSFER_MAX_BYTES`].
+pub const AUTO_TRANSFER_MAX_ENTRIES: usize = 50_000;
+
+/// Cuántos lotes de portapapeles recibidos se conservan en la caché. Dos y no
+/// uno: un pegado del lote anterior puede seguir copiando cuando llega el
+/// siguiente.
+const CLIPBOARD_CACHE_KEEP: usize = 2;
 
 /// Carpeta `ionconnect` en el **Escritorio** del usuario — el mismo lugar en
 /// todos los sistemas operativos, independiente del nombre localizado de la
@@ -47,16 +78,29 @@ pub fn default_transfer_dir() -> PathBuf {
     desktop.join("ionconnect")
 }
 
+/// Carpeta de caché donde aterrizan los archivos copiados en otro equipo
+/// hasta que el usuario los pega. Cada lote va a su propia subcarpeta.
+#[must_use]
+pub fn clipboard_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ionconnect")
+        .join("clipboard")
+}
+
 /// Crea la carpeta de transferencias si no existe — se llama al arrancar
-/// `core` para que el usuario la vea antes de la primera transferencia.
+/// `core` para que el usuario la vea antes de la primera transferencia — y
+/// vacía la caché de portapapeles de la ejecución anterior (el portapapeles
+/// ya no apunta ahí).
 pub async fn ensure_transfer_dir() {
     let dir = default_transfer_dir();
     match fs::create_dir_all(&dir).await {
         Ok(()) => info!(dir = %dir.display(), "carpeta de transferencias lista"),
         Err(err) => {
-            warn!(%err, dir = %dir.display(), "no se pudo crear la carpeta de transferencias")
+            warn!(%err, dir = %dir.display(), "no se pudo crear la carpeta de transferencias");
         }
     }
+    let _ = fs::remove_dir_all(clipboard_cache_dir()).await;
 }
 
 /// Adivina un `MIME` razonable por la extensión — no vale la pena una
@@ -88,15 +132,10 @@ fn mime_from_ext(path: &Path) -> String {
     .to_string()
 }
 
-/// Deja solo el nombre de archivo (sin ruta, sin `..`, sin separadores) para
-/// que un emisor no pueda hacer que el receptor escriba fuera de su carpeta
-/// de descargas.
-fn sanitize_name(name: &str) -> String {
-    let base = Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("archivo");
-    let cleaned: String = base
+/// Sanea un único componente de ruta: sin separadores ni `NUL`, y nunca
+/// vacío, `.` ni `..`.
+fn sanitize_component(component: &str) -> Option<String> {
+    let cleaned: String = component
         .chars()
         .map(|c| {
             if matches!(c, '/' | '\\' | '\0') {
@@ -108,10 +147,36 @@ fn sanitize_name(name: &str) -> String {
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "archivo".to_string()
+        None
     } else {
-        trimmed.to_string()
+        Some(trimmed.to_string())
     }
+}
+
+/// Deja solo el nombre de archivo (sin ruta, sin `..`, sin separadores) para
+/// que un emisor no pueda hacer que el receptor escriba fuera de su carpeta
+/// de descargas.
+fn sanitize_name(name: &str) -> String {
+    sanitize_relative(name)
+        .pop()
+        .unwrap_or_else(|| "archivo".to_string())
+}
+
+/// Parte `name` en componentes seguros. Acepta `/` y `\` como separador (el
+/// emisor puede ser Windows), descarta `.`, `..`, vacíos, prefijos de unidad
+/// y la raíz — así una ruta relativa de un lote nunca puede escapar de la
+/// carpeta destino. Nunca devuelve una lista vacía.
+fn sanitize_relative(name: &str) -> Vec<String> {
+    let mut parts: Vec<String> = name
+        .split(['/', '\\'])
+        // `C:` de una ruta de Windows: no es un nombre válido de carpeta.
+        .filter(|part| !(part.len() == 2 && part.ends_with(':')))
+        .filter_map(sanitize_component)
+        .collect();
+    if parts.is_empty() {
+        parts.push("archivo".to_string());
+    }
+    parts
 }
 
 /// Primera ruta libre en `dir` para `name`: `foto.png`, luego
@@ -140,33 +205,160 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 struct Partial {
     file: fs::File,
     part_path: PathBuf,
+    /// Carpeta donde queda el archivo terminado.
+    dest_dir: PathBuf,
     final_name: String,
+    /// Lote al que pertenece y si es una entrada de primer nivel de ese lote
+    /// (las de primer nivel son las que se publican en el portapapeles).
+    batch: Option<(u64, bool)>,
     received: u64,
     total: u64,
+}
+
+/// Un lote entrante a medio recibir.
+struct IncomingBatch {
+    kind: FileBatchKind,
+    /// Carpeta base del lote: la de transferencias, o una subcarpeta propia
+    /// de la caché de portapapeles.
+    dir: PathBuf,
+    /// Carpetas de primer nivel ya materializadas: nombre que mandó el emisor
+    /// → ruta real (puede diferir si ya existía una con ese nombre).
+    roots: HashMap<String, PathBuf>,
+    /// Entradas de primer nivel ya completas, en orden de llegada.
+    top_level: Vec<PathBuf>,
+}
+
+/// Un lote que terminó de llegar — ver [`IncomingFiles::on_batch_end`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedBatch {
+    pub kind: FileBatchKind,
+    /// Archivos y carpetas de primer nivel del lote, ya en su ruta final.
+    pub paths: Vec<PathBuf>,
 }
 
 /// Estado del lado receptor: las transferencias entrantes en curso.
 pub struct IncomingFiles {
     dir: PathBuf,
+    clipboard_dir: PathBuf,
     active: HashMap<u64, Partial>,
+    batches: HashMap<u64, IncomingBatch>,
 }
 
 impl IncomingFiles {
+    /// `dir` es la carpeta de transferencias; los lotes de portapapeles van
+    /// a [`clipboard_cache_dir`].
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
+        Self::with_clipboard_dir(dir, clipboard_cache_dir())
+    }
+
+    #[must_use]
+    pub fn with_clipboard_dir(dir: PathBuf, clipboard_dir: PathBuf) -> Self {
         Self {
             dir,
+            clipboard_dir,
             active: HashMap::new(),
+            batches: HashMap::new(),
         }
     }
 
+    /// Estado del lote `batch`, creándolo (y su carpeta) la primera vez que
+    /// aparece.
+    async fn batch_entry(&mut self, batch: FileBatch) -> std::io::Result<&mut IncomingBatch> {
+        if !self.batches.contains_key(&batch.id) {
+            let dir = match batch.kind {
+                FileBatchKind::Downloads => self.dir.clone(),
+                FileBatchKind::Clipboard => {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
+                    self.clipboard_dir.join(format!("{stamp}-{}", batch.id))
+                }
+            };
+            fs::create_dir_all(&dir).await?;
+            self.batches.insert(
+                batch.id,
+                IncomingBatch {
+                    kind: batch.kind,
+                    dir,
+                    roots: HashMap::new(),
+                    top_level: Vec::new(),
+                },
+            );
+        }
+        Ok(self
+            .batches
+            .get_mut(&batch.id)
+            .expect("el lote se acaba de insertar"))
+    }
+
+    /// Resuelve dónde va una entrada: `(carpeta destino, nombre final,
+    /// es de primer nivel)`. Para un lote, materializa la carpeta de primer
+    /// nivel la primera vez que se la ve, con un nombre que no pise nada.
+    async fn resolve_destination(
+        &mut self,
+        offer: &FileOffer,
+    ) -> std::io::Result<(PathBuf, String, bool)> {
+        let Some(batch) = offer.batch else {
+            fs::create_dir_all(&self.dir).await?;
+            return Ok((self.dir.clone(), sanitize_name(&offer.name), true));
+        };
+        let mut parts = sanitize_relative(&offer.name);
+        let name = parts.pop().expect("sanitize_relative nunca devuelve vacío");
+        let state = self.batch_entry(batch).await?;
+        if parts.is_empty() {
+            return Ok((state.dir.clone(), name, true));
+        }
+        let top = parts.remove(0);
+        let root = if let Some(root) = state.roots.get(&top) {
+            root.clone()
+        } else {
+            let root = unique_path(&state.dir, &top);
+            fs::create_dir_all(&root).await?;
+            state.roots.insert(top, root.clone());
+            state.top_level.push(root.clone());
+            root
+        };
+        let dest_dir = parts.iter().fold(root, |dir, part| dir.join(part));
+        fs::create_dir_all(&dest_dir).await?;
+        Ok((dest_dir, name, false))
+    }
+
     pub async fn on_offer(&mut self, offer: FileOffer) {
-        if let Err(err) = fs::create_dir_all(&self.dir).await {
-            warn!(%err, dir = %self.dir.display(), "no se pudo crear la carpeta de descargas");
+        let (dest_dir, name, top_level) = match self.resolve_destination(&offer).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                warn!(%err, "no se pudo preparar la carpeta destino de la transferencia");
+                return;
+            }
+        };
+
+        if offer.mime == MIME_DIRECTORY {
+            // Una carpeta (posiblemente vacía): solo se crea, no lleva trozos.
+            // De primer nivel pasa por `roots` para no pisar una existente.
+            let created = if let (true, Some(batch)) = (top_level, offer.batch) {
+                let state = self
+                    .batches
+                    .get_mut(&batch.id)
+                    .expect("resolve_destination ya creó el lote");
+                if state.roots.contains_key(&name) {
+                    Ok(())
+                } else {
+                    let root = unique_path(&state.dir, &name);
+                    state.roots.insert(name.clone(), root.clone());
+                    state.top_level.push(root.clone());
+                    fs::create_dir_all(&root).await
+                }
+            } else {
+                fs::create_dir_all(dest_dir.join(&name)).await
+            };
+            if let Err(err) = created {
+                warn!(%err, %name, "no se pudo crear la carpeta recibida");
+            }
             return;
         }
-        let name = sanitize_name(&offer.name);
-        let part_path = self.dir.join(format!("{name}.{}.part", offer.transfer_id));
+
+        let part_path = dest_dir.join(format!("{name}.{}.part", offer.transfer_id));
         match fs::File::create(&part_path).await {
             Ok(file) => {
                 info!(%name, size = offer.total_size, mime = %offer.mime, "recibiendo archivo");
@@ -175,7 +367,9 @@ impl IncomingFiles {
                     Partial {
                         file,
                         part_path,
+                        dest_dir,
                         final_name: name,
+                        batch: offer.batch.map(|batch| (batch.id, top_level)),
                         received: 0,
                         total: offer.total_size,
                     },
@@ -200,8 +394,10 @@ impl IncomingFiles {
     }
 
     /// Cierra y renombra la transferencia `transfer_id`. Devuelve la ruta
-    /// final si terminó bien — `core` la loguea como `archivo recibido` para
-    /// que la GUI la muestre.
+    /// final si terminó bien. Los archivos que quedan en la carpeta de
+    /// transferencias se loguean como `archivo recibido` para que la GUI los
+    /// muestre; los de un lote de portapapeles no (van a la caché y se
+    /// anuncian todos juntos al cerrarse el lote).
     pub async fn on_end(&mut self, end: FileEnd) -> Option<PathBuf> {
         let mut partial = self.active.remove(&end.transfer_id)?;
         if let Err(err) = partial.file.flush().await {
@@ -215,18 +411,27 @@ impl IncomingFiles {
                 "el archivo recibido no coincide en tamaño con lo anunciado — se conserva igual"
             );
         }
-        let final_path = unique_path(&self.dir, &partial.final_name);
-        match fs::rename(&partial.part_path, &final_path).await {
-            Ok(()) => {
-                info!(path = %final_path.display(), "archivo recibido");
-                Some(final_path)
-            }
-            Err(err) => {
-                warn!(%err, "no se pudo mover el archivo recibido a su nombre final");
-                let _ = fs::remove_file(&partial.part_path).await;
-                None
-            }
+        let final_path = unique_path(&partial.dest_dir, &partial.final_name);
+        if let Err(err) = fs::rename(&partial.part_path, &final_path).await {
+            warn!(%err, "no se pudo mover el archivo recibido a su nombre final");
+            let _ = fs::remove_file(&partial.part_path).await;
+            return None;
         }
+        let batch = partial
+            .batch
+            .and_then(|(id, top_level)| self.batches.get_mut(&id).map(|b| (b, top_level)));
+        match batch {
+            Some((state, top_level)) => {
+                if top_level {
+                    state.top_level.push(final_path.clone());
+                }
+                if state.kind == FileBatchKind::Downloads && top_level {
+                    info!(path = %final_path.display(), "archivo recibido");
+                }
+            }
+            None => info!(path = %final_path.display(), "archivo recibido"),
+        }
+        Some(final_path)
     }
 
     pub async fn on_abort(&mut self, abort: FileAbort) {
@@ -236,25 +441,96 @@ impl IncomingFiles {
         }
     }
 
-    /// Descarta todos los `.part` a medias — al cerrar la sesión.
+    /// Cierra el lote `end.id` y devuelve lo que llegó. `None` si el lote no
+    /// existe o llegó vacío (nada que publicar).
+    pub async fn on_batch_end(&mut self, end: FileBatchEnd) -> Option<CompletedBatch> {
+        let state = self.batches.remove(&end.id)?;
+        if state.top_level.is_empty() {
+            if state.kind == FileBatchKind::Clipboard {
+                let _ = fs::remove_dir_all(&state.dir).await;
+            }
+            return None;
+        }
+        match state.kind {
+            FileBatchKind::Downloads => {
+                // Las carpetas de primer nivel no pasaron por `on_end`: se
+                // anuncian acá para que la GUI también las liste.
+                for root in state.roots.values() {
+                    info!(path = %root.display(), "archivo recibido");
+                }
+            }
+            FileBatchKind::Clipboard => {
+                prune_clipboard_cache(&self.clipboard_dir, &state.dir).await;
+            }
+        }
+        Some(CompletedBatch {
+            kind: state.kind,
+            paths: state.top_level,
+        })
+    }
+
+    /// Descarta todo lo que quedó a medias — al cerrar la sesión.
     pub async fn abort_all(&mut self) {
         for (_, partial) in self.active.drain() {
             let _ = fs::remove_file(&partial.part_path).await;
         }
+        for (_, batch) in self.batches.drain() {
+            // Un lote de portapapeles incompleto no sirve para pegar; uno de
+            // arrastre conserva lo que sí llegó entero.
+            if batch.kind == FileBatchKind::Clipboard {
+                let _ = fs::remove_dir_all(&batch.dir).await;
+            }
+        }
     }
 }
 
-/// Lee `path` y emite `FileOffer` + `FileChunk`* + `FileEnd` por `sink`. Un
-/// error al abrir o leer emite `FileAbort` (o nada, si ni siquiera se pudo
-/// anunciar). `transfer_id` lo elige quien llama — un contador por conexión
-/// alcanza. Si `sink` se cierra (la sesión terminó) se corta sin ruido.
-pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Message>) {
+/// Borra los lotes viejos de la caché de portapapeles, conservando `current`
+/// y los [`CLIPBOARD_CACHE_KEEP`]` - 1` anteriores más recientes. Los nombres
+/// de subcarpeta empiezan con la marca de tiempo, así que ordenar por nombre
+/// es ordenar por antigüedad.
+async fn prune_clipboard_cache(cache: &Path, current: &Path) {
+    let Ok(mut entries) = fs::read_dir(cache).await else {
+        return;
+    };
+    let mut older = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path != current {
+            older.push(path);
+        }
+    }
+    older.sort();
+    let keep = CLIPBOARD_CACHE_KEEP.saturating_sub(1);
+    let stale = older.len().saturating_sub(keep);
+    for path in older.into_iter().take(stale) {
+        let _ = fs::remove_dir_all(&path).await;
+    }
+}
+
+/// Lee `path` y emite `FileOffer` + `FileChunk`* + `FileEnd` por `sink`,
+/// anunciándolo con su propio nombre y sin lote. Ver [`send_entry`].
+#[cfg(test)]
+async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Message>) {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("archivo")
         .to_string();
+    send_entry(path, name, transfer_id, None, sink).await;
+}
 
+/// Lee `path` y lo emite por `sink` anunciado como `name` (nombre o ruta
+/// relativa dentro de un lote). Un error al abrir o leer emite `FileAbort`
+/// (o nada, si ni siquiera se pudo anunciar). Si `sink` se cierra (la sesión
+/// terminó) se corta sin ruido. Devuelve `false` solo en ese caso, para que
+/// quien manda un lote deje de insistir.
+async fn send_entry(
+    path: &Path,
+    name: String,
+    transfer_id: u64,
+    batch: Option<FileBatch>,
+    sink: &mpsc::Sender<Message>,
+) -> bool {
     let mut file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(err) => {
@@ -262,7 +538,7 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
             // cuando no tiene espacios; la GUI parsea de `name=` al fin de
             // línea, así que soporta nombres con espacios.
             warn!(%err, %name, "no se pudo abrir el archivo a enviar");
-            return;
+            return true;
         }
     };
     let total = file.metadata().await.map_or(0, |m| m.len());
@@ -274,11 +550,12 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
             name: name.clone(),
             total_size: total,
             mime,
+            batch,
         }))
         .await
         .is_err()
     {
-        return;
+        return false;
     }
     info!(size = total, %name, "enviando archivo");
 
@@ -295,7 +572,7 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
                     .await
                     .is_err()
                 {
-                    return;
+                    return false;
                 }
                 // Cederle el turno al resto de tareas: una transferencia
                 // grande no debe congelar el reenvío de mouse/teclado.
@@ -303,18 +580,154 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
             }
             Err(err) => {
                 warn!(%err, %name, "error leyendo el archivo — se aborta la transferencia");
-                let _ = sink
+                return sink
                     .send(Message::FileAbort(FileAbort {
                         transfer_id,
                         reason: err.to_string(),
                     }))
-                    .await;
-                return;
+                    .await
+                    .is_ok();
             }
         }
     }
-    let _ = sink.send(Message::FileEnd(FileEnd { transfer_id })).await;
+    let delivered = sink
+        .send(Message::FileEnd(FileEnd { transfer_id }))
+        .await
+        .is_ok();
     info!(%name, "archivo enviado");
+    delivered
+}
+
+/// Una entrada (archivo o carpeta) de un lote saliente.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutgoingEntry {
+    path: PathBuf,
+    /// Ruta relativa con `/`, tal como viaja en `FileOffer::name`.
+    name: String,
+    is_dir: bool,
+}
+
+/// Aplana `paths` (archivos y/o carpetas) en la lista de entradas a mandar,
+/// recorriendo las carpetas en profundidad. Devuelve también el total de
+/// bytes. Los enlaces simbólicos se saltean: seguirlos puede sacar la
+/// transferencia de lo que el usuario seleccionó, o no terminar nunca.
+/// Corta en cuanto se supera `max_entries` — quien llama lo trata como
+/// "demasiado grande".
+fn collect_entries(paths: &[PathBuf], max_entries: usize) -> (Vec<OutgoingEntry>, u64) {
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+    let mut pending: Vec<(PathBuf, String)> = paths
+        .iter()
+        .rev()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_string();
+            Some((path.clone(), name))
+        })
+        .collect();
+    while let Some((path, name)) = pending.pop() {
+        if entries.len() > max_entries {
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            entries.push(OutgoingEntry {
+                path: path.clone(),
+                name: name.clone(),
+                is_dir: true,
+            });
+            let Ok(children) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            let mut children: Vec<_> = children.filter_map(Result::ok).collect();
+            children.sort_by_key(std::fs::DirEntry::file_name);
+            for child in children.into_iter().rev() {
+                if let Some(child_name) = child.file_name().to_str() {
+                    pending.push((child.path(), format!("{name}/{child_name}")));
+                }
+            }
+        } else if meta.is_file() {
+            total += meta.len();
+            entries.push(OutgoingEntry {
+                path,
+                name,
+                is_dir: false,
+            });
+        }
+    }
+    (entries, total)
+}
+
+/// Manda `paths` (archivos y/o carpetas) por `sink`.
+///
+/// `kind` es `None` para el envío explícito desde la GUI, sin tope de
+/// tamaño. Con `Some(_)` es una transferencia automática (portapapeles o
+/// arrastre): se respeta [`AUTO_TRANSFER_MAX_BYTES`] y siempre viaja como
+/// lote. Un único archivo suelto sin `kind` viaja sin lote, igual que
+/// siempre.
+pub async fn send_paths(
+    paths: Vec<PathBuf>,
+    kind: Option<FileBatchKind>,
+    sink: &mpsc::Sender<Message>,
+) {
+    let max_entries = if kind.is_some() {
+        AUTO_TRANSFER_MAX_ENTRIES
+    } else {
+        usize::MAX
+    };
+    let collected =
+        tokio::task::spawn_blocking(move || collect_entries(&paths, max_entries)).await;
+    let Ok((entries, total)) = collected else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    if kind.is_some() && (total > AUTO_TRANSFER_MAX_BYTES || entries.len() > max_entries) {
+        warn!(
+            bytes = total,
+            entries = entries.len(),
+            "lo copiado/arrastrado es demasiado grande para pasarlo solo — usá el envío de archivos de la app"
+        );
+        return;
+    }
+
+    let single_file = entries.len() == 1 && !entries[0].is_dir;
+    let batch = match kind {
+        None if single_file => None,
+        None => Some(FileBatchKind::Downloads),
+        Some(kind) => Some(kind),
+    }
+    .map(|kind| FileBatch {
+        id: NEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed),
+        kind,
+    });
+
+    for entry in entries {
+        let transfer_id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        let delivered = if entry.is_dir {
+            sink.send(Message::FileOffer(FileOffer {
+                transfer_id,
+                name: entry.name,
+                total_size: 0,
+                mime: MIME_DIRECTORY.to_string(),
+                batch,
+            }))
+            .await
+            .is_ok()
+        } else {
+            send_entry(&entry.path, entry.name, transfer_id, batch, sink).await
+        };
+        if !delivered {
+            return;
+        }
+    }
+    if let Some(batch) = batch {
+        let _ = sink
+            .send(Message::FileBatchEnd(FileBatchEnd { id: batch.id }))
+            .await;
+    }
 }
 
 /// A dónde van los mensajes de una transferencia saliente, según el rol de
@@ -323,6 +736,8 @@ pub async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Messag
 pub enum FileSink {
     /// Servidor: se difunde a todos los peers conectados.
     Broadcast(Arc<Routing>),
+    /// Servidor: a un único peer (el que tiene o acaba de recibir el control).
+    Peer(Arc<Routing>, DeviceId),
     /// Cliente: se empuja al bucle de sesión, que lo manda por su única
     /// conexión con el servidor.
     Channel(mpsc::Sender<Message>),
@@ -330,9 +745,9 @@ pub enum FileSink {
 
 /// Escucha el canal IPC local (la GUI de este equipo) y, por cada
 /// `FileOffer` que llega —cuyo `name` es una **ruta local absoluta** elegida
-/// por la GUI—, lee ese archivo y lo manda al otro extremo. Es la mitad
-/// "enviar" de la transferencia; la de "recibir" vive en el bucle de sesión
-/// de `server`/`client`, que alimenta un [`IncomingFiles`].
+/// por la GUI—, lee ese archivo o carpeta y lo manda al otro extremo. Es la
+/// mitad "enviar" de la transferencia; la de "recibir" vive en el bucle de
+/// sesión de `server`/`client`, que alimenta un [`IncomingFiles`].
 ///
 /// Corre hasta que el proceso termina; un fallo al abrir el socket IPC solo
 /// deshabilita el envío desde la GUI (recibir sigue funcionando).
@@ -361,30 +776,37 @@ pub async fn serve_ipc_file_sends(token_file: PathBuf, sink: FileSink) {
                     continue;
                 };
                 let path = PathBuf::from(offer.name);
-                let transfer_id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
                 let sink = sink.clone();
-                tokio::spawn(async move { deliver_file(&path, transfer_id, &sink).await });
+                tokio::spawn(async move { deliver_paths(vec![path], None, &sink).await });
             }
         });
     }
 }
 
-/// Manda un archivo local al otro extremo, adaptando `send_file` al `sink`
-/// concreto. Un `mpsc` acotado da la contrapresión: si la red no da abasto,
-/// `send_file` se frena en vez de acumular trozos en memoria.
-async fn deliver_file(path: &Path, transfer_id: u64, sink: &FileSink) {
-    match sink {
+/// Manda archivos/carpetas locales al otro extremo, adaptando
+/// [`send_paths`] al `sink` concreto. Un `mpsc` acotado da la contrapresión:
+/// si la red no da abasto, la lectura se frena en vez de acumular trozos en
+/// memoria.
+pub async fn deliver_paths(paths: Vec<PathBuf>, kind: Option<FileBatchKind>, sink: &FileSink) {
+    let routed: Box<dyn Fn(Message) + Send> = match sink {
+        FileSink::Channel(tx) => return send_paths(paths, kind, tx).await,
         FileSink::Broadcast(routing) => {
-            let (tx, mut rx) = mpsc::channel::<Message>(8);
-            let path = path.to_path_buf();
-            let feeder = tokio::spawn(async move { send_file(&path, transfer_id, &tx).await });
-            while let Some(message) = rx.recv().await {
-                routing.broadcast(&message);
-            }
-            let _ = feeder.await;
+            let routing = routing.clone();
+            Box::new(move |message| routing.broadcast(&message))
         }
-        FileSink::Channel(tx) => send_file(path, transfer_id, tx).await,
+        FileSink::Peer(routing, device) => {
+            let (routing, device) = (routing.clone(), *device);
+            Box::new(move |message| {
+                routing.send_to(device, message);
+            })
+        }
+    };
+    let (tx, mut rx) = mpsc::channel::<Message>(8);
+    let feeder = tokio::spawn(async move { send_paths(paths, kind, &tx).await });
+    while let Some(message) = rx.recv().await {
+        routed(message);
     }
+    let _ = feeder.await;
 }
 
 #[cfg(test)]
@@ -475,6 +897,7 @@ mod tests {
             name: source.to_string_lossy().into_owned(),
             total_size: 0,
             mime: String::new(),
+            batch: None,
         }))
         .await
         .expect("enviar el FileOffer por IPC");
@@ -536,6 +959,7 @@ mod tests {
                 name: "saludo.txt".to_string(),
                 total_size: 11,
                 mime: "text/plain".to_string(),
+                batch: None,
             })
             .await;
         incoming
@@ -577,6 +1001,7 @@ mod tests {
                 name: "incompleto.bin".to_string(),
                 total_size: 100,
                 mime: "application/octet-stream".to_string(),
+                batch: None,
             })
             .await;
         incoming
@@ -633,6 +1058,176 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(reassembled, payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitize_relative_never_escapes_the_destination() {
+        assert_eq!(sanitize_relative("fotos/2024/a.png"), ["fotos", "2024", "a.png"]);
+        assert_eq!(sanitize_relative("../../etc/passwd"), ["etc", "passwd"]);
+        assert_eq!(sanitize_relative("C:\\Users\\ana\\doc.txt"), ["Users", "ana", "doc.txt"]);
+        assert_eq!(sanitize_relative("/abs/./x"), ["abs", "x"]);
+        assert_eq!(sanitize_relative("../.."), ["archivo"]);
+    }
+
+    /// Arma `raiz/{a.txt, sub/{b.txt, vacia/}}` y devuelve `raiz`.
+    fn sample_tree(base: &Path) -> PathBuf {
+        let root = base.join("raiz");
+        std::fs::create_dir_all(root.join("sub/vacia")).unwrap();
+        std::fs::write(root.join("a.txt"), b"contenido a").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"contenido b").unwrap();
+        root
+    }
+
+    /// Manda `paths` con `send_paths` y lo reensambla con `incoming`,
+    /// devolviendo el lote completado (si lo hubo).
+    async fn round_trip(
+        paths: Vec<PathBuf>,
+        kind: Option<FileBatchKind>,
+        incoming: &mut IncomingFiles,
+    ) -> Option<CompletedBatch> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let sender = tokio::spawn(async move { send_paths(paths, kind, &tx).await });
+        let mut completed = None;
+        while let Some(message) = rx.recv().await {
+            match message {
+                Message::FileOffer(o) => incoming.on_offer(o).await,
+                Message::FileChunk(c) => incoming.on_chunk(c).await,
+                Message::FileEnd(e) => {
+                    incoming.on_end(e).await;
+                }
+                Message::FileBatchEnd(e) => completed = incoming.on_batch_end(e).await,
+                other => panic!("mensaje inesperado: {other:?}"),
+            }
+        }
+        sender.await.unwrap();
+        completed
+    }
+
+    #[test]
+    fn collect_entries_walks_directories_in_order_and_skips_symlinks() {
+        let dir = tmp_dir("collect");
+        let root = sample_tree(&dir);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", root.join("enlace")).unwrap();
+
+        let (entries, total) = collect_entries(std::slice::from_ref(&root), usize::MAX);
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["raiz", "raiz/a.txt", "raiz/sub", "raiz/sub/b.txt", "raiz/sub/vacia"]);
+        assert_eq!(total, 22);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dragged_folder_lands_in_downloads_without_clobbering() {
+        let dir = tmp_dir("drag");
+        let root = sample_tree(&dir.join("origen"));
+        let dest = dir.join("destino");
+        // Ya hay una `raiz` en destino: la nueva no debe mezclarse con ella.
+        std::fs::create_dir_all(dest.join("raiz")).unwrap();
+        std::fs::write(dest.join("raiz/previo.txt"), b"x").unwrap();
+
+        let mut incoming = IncomingFiles::with_clipboard_dir(dest.clone(), dir.join("cache"));
+        let completed = round_trip(vec![root], Some(FileBatchKind::Downloads), &mut incoming)
+            .await
+            .expect("el lote debería completarse");
+
+        let landed = dest.join("raiz (1)");
+        assert_eq!(completed.kind, FileBatchKind::Downloads);
+        assert_eq!(completed.paths, vec![landed.clone()]);
+        assert_eq!(std::fs::read(landed.join("a.txt")).unwrap(), b"contenido a");
+        assert_eq!(std::fs::read(landed.join("sub/b.txt")).unwrap(), b"contenido b");
+        assert!(landed.join("sub/vacia").is_dir(), "las carpetas vacías también viajan");
+        assert_eq!(
+            std::fs::read_dir(dest.join("raiz")).unwrap().count(),
+            1,
+            "la carpeta que ya existía queda intacta"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn copied_files_land_in_the_clipboard_cache_and_are_reported_top_level_only() {
+        let dir = tmp_dir("clip");
+        let root = sample_tree(&dir.join("origen"));
+        let loose = dir.join("origen/suelto.txt");
+        std::fs::write(&loose, b"suelto").unwrap();
+        let downloads = dir.join("destino");
+        let cache = dir.join("cache");
+
+        let mut incoming = IncomingFiles::with_clipboard_dir(downloads.clone(), cache.clone());
+        let completed = round_trip(
+            vec![root, loose],
+            Some(FileBatchKind::Clipboard),
+            &mut incoming,
+        )
+        .await
+        .expect("el lote debería completarse");
+
+        assert_eq!(completed.kind, FileBatchKind::Clipboard);
+        assert_eq!(completed.paths.len(), 2, "solo lo de primer nivel va al portapapeles");
+        assert!(completed.paths.iter().all(|p| p.starts_with(&cache)));
+        assert_eq!(completed.paths[0].file_name().unwrap(), "raiz");
+        assert_eq!(std::fs::read(&completed.paths[1]).unwrap(), b"suelto");
+        assert!(completed.paths[0].join("sub/b.txt").is_file());
+        assert!(!downloads.exists(), "nada de esto va a la carpeta de transferencias");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn clipboard_cache_keeps_only_the_most_recent_batches() {
+        let dir = tmp_dir("prune");
+        let file = dir.join("origen.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let cache = dir.join("cache");
+        let mut incoming = IncomingFiles::with_clipboard_dir(dir.join("destino"), cache.clone());
+
+        for _ in 0..4 {
+            round_trip(vec![file.clone()], Some(FileBatchKind::Clipboard), &mut incoming).await;
+            // El nombre de la subcarpeta lleva la marca de tiempo en ms.
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), CLIPBOARD_CACHE_KEEP);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_single_file_from_the_gui_still_travels_without_a_batch() {
+        let dir = tmp_dir("single");
+        let file = dir.join("uno.txt");
+        std::fs::write(&file, b"1").unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        send_paths(vec![file], None, &tx).await;
+        drop(tx);
+        let mut saw_batch_end = false;
+        while let Some(message) = rx.recv().await {
+            match message {
+                Message::FileOffer(o) => assert_eq!(o.batch, None),
+                Message::FileBatchEnd(_) => saw_batch_end = true,
+                _ => {}
+            }
+        }
+        assert!(!saw_batch_end);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn abort_all_drops_an_unfinished_clipboard_batch() {
+        let dir = tmp_dir("abortbatch");
+        let cache = dir.join("cache");
+        let mut incoming = IncomingFiles::with_clipboard_dir(dir.join("destino"), cache.clone());
+        incoming
+            .on_offer(FileOffer {
+                transfer_id: 1,
+                name: "a.txt".to_string(),
+                total_size: 5,
+                mime: String::new(),
+                batch: Some(FileBatch { id: 9, kind: FileBatchKind::Clipboard }),
+            })
+            .await;
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        incoming.abort_all().await;
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

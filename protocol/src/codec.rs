@@ -73,6 +73,10 @@ pub fn encode_message_into(buf: &mut BytesMut, message: &Message) -> Result<(), 
         Message::FileChunk(payload) => encode_postcard(buf, payload)?,
         Message::FileEnd(payload) => encode_postcard(buf, payload)?,
         Message::FileAbort(payload) => encode_postcard(buf, payload)?,
+        Message::FileBatchEnd(payload) => encode_postcard(buf, payload)?,
+        Message::ClipboardFilesOffer(payload) => encode_postcard(buf, payload)?,
+        Message::ClipboardFilesRequest(payload) => encode_postcard(buf, payload)?,
+        Message::DragQuery => {}
     }
 
     Ok(())
@@ -155,6 +159,14 @@ pub fn decode_message(payload: &[u8]) -> Result<Message, ProtocolError> {
         MessageType::FileChunk => Ok(Message::FileChunk(postcard::from_bytes(buf)?)),
         MessageType::FileEnd => Ok(Message::FileEnd(postcard::from_bytes(buf)?)),
         MessageType::FileAbort => Ok(Message::FileAbort(postcard::from_bytes(buf)?)),
+        MessageType::FileBatchEnd => Ok(Message::FileBatchEnd(postcard::from_bytes(buf)?)),
+        MessageType::ClipboardFilesOffer => {
+            Ok(Message::ClipboardFilesOffer(postcard::from_bytes(buf)?))
+        }
+        MessageType::ClipboardFilesRequest => {
+            Ok(Message::ClipboardFilesRequest(postcard::from_bytes(buf)?))
+        }
+        MessageType::DragQuery => Ok(Message::DragQuery),
     }
 }
 
@@ -194,5 +206,8 @@ const fn estimated_capacity(message: &Message) -> usize {
         Message::FileChunk(chunk) => chunk.data.len() + 16,
         Message::FileEnd(_) => 9,
         Message::FileAbort(_) => 48,
+        Message::FileBatchEnd(_) | Message::ClipboardFilesRequest(_) => 11,
+        Message::ClipboardFilesOffer(_) => 16,
+        Message::DragQuery => 1,
     }
 }
