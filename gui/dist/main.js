@@ -31,6 +31,12 @@ const ICONS = {
   alert: '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="5.8" stroke="currentColor" stroke-width="1.4"/><path d="M7 4.2v3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="7" cy="9.7" r=".85" fill="currentColor"/></svg>',
   screens:
     '<svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><rect x="1.5" y="5" width="11" height="8.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><rect x="14" y="12.5" width="10.5" height="8.5" rx="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M7 13.5v2.5a2 2 0 0 0 2 2h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  server:
+    '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true"><rect x="1.5" y="2.5" width="15" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M6 15.5h6M9 12.5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M7.2 6.2 9 8l1.8-1.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" transform="rotate(180 9 7.1)"/></svg>',
+  client:
+    '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true"><rect x="3" y="3" width="12" height="8.5" rx="1.6" stroke="currentColor" stroke-width="1.5"/><path d="M1.5 14.5h15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M7.2 6.2 9 8l1.8-1.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  upload:
+    '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 10.5V2.5M4.8 5.5 8 2.3l3.2 3.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 10v1.8a1.7 1.7 0 0 0 1.7 1.7h7.6a1.7 1.7 0 0 0 1.7-1.7V10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
   plug: '<svg width="26" height="26" viewBox="0 0 26 26" fill="none" aria-hidden="true"><path d="M9.5 3.5v5M16.5 3.5v5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M6.5 8.5h13v3a6.5 6.5 0 0 1-13 0v-3Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M13 18v4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
 };
 
@@ -63,7 +69,7 @@ const CORE_STATUS_LABELS = {
   connected: "Conectado",
   retrying: "Reintentando conexión…",
   error: "Error — mirá la actividad",
-  port_busy: "Puerto ocupado — ya hay otro ionconnect-core (¿servicio systemd?)",
+  port_busy: "Puerto ocupado",
   stopped: "Detenido",
 };
 
@@ -77,7 +83,34 @@ const CORE_STATUS_CLASSES = {
   stopped: "status--offline",
 };
 
+/// Una línea que explica qué significa cada estado y qué hacer.
+function statusDescription(status, role) {
+  switch (status) {
+    case "starting":
+      return "Arrancando el servicio…";
+    case "listening":
+      return "Esperando que un cliente se conecte.";
+    case "connected":
+      return role === "server"
+        ? "Mové el mouse hacia un borde para pasar al otro equipo."
+        : "Este equipo recibe el mouse y el teclado del servidor.";
+    case "retrying":
+      return role === "client"
+        ? "Buscando al servidor en la red local…"
+        : "Reintentando…";
+    case "error":
+      return "Algo falló. Abrí la actividad del servicio para ver el detalle.";
+    case "port_busy":
+      return "Otro ionconnect-core usa el puerto. Deshabilitá el servicio systemd viejo.";
+    default:
+      return role === "server"
+        ? "Iniciá el servidor para compartir este mouse y teclado."
+        : "Conectate para recibir el control del servidor.";
+  }
+}
+
 let corePollTimer = null;
+let lastCoreStatus = "stopped";
 
 const invoke = () => window.__TAURI__.core.invoke;
 
@@ -135,8 +168,28 @@ function copyDeviceId() {
    Rol y control del servicio
    ========================================================================== */
 
+function getRole() {
+  return document.querySelector('input[name="role"]:checked')?.value ?? "server";
+}
+
+function setRole(role) {
+  const radio = document.querySelector(`input[name="role"][value="${role}"]`);
+  if (radio) radio.checked = true;
+}
+
+/// Nombre, rol e icono de la tarjeta principal.
+function renderHero() {
+  const role = getRole();
+  document.getElementById("hero-name").textContent =
+    document.getElementById("device_name").value.trim() || "Este equipo";
+  document.getElementById("hero-role").textContent =
+    role === "server" ? "Servidor · comparte mouse y teclado" : "Cliente · recibe el control";
+  document.getElementById("hero-glyph").innerHTML = role === "server" ? ICONS.server : ICONS.client;
+  setConnectionIndicator(lastCoreStatus);
+}
+
 function updateRoleVisibility() {
-  const role = document.getElementById("role").value;
+  const role = getRole();
   const auto = document.getElementById("discovery_enabled").checked;
   // La dirección manual solo tiene sentido en un cliente sin búsqueda automática.
   document.getElementById("client-fields").hidden = !(role === "client" && !auto);
@@ -151,20 +204,32 @@ function updateRoleVisibility() {
       : auto
         ? "Si cambiás de servidor o de IP, se reconecta solo."
         : "";
-  // `listen_port` vive dentro de #server-fields: si quedara `required`
-  // mientras está oculto, la validación del formulario bloquearía el envío
-  // sin poder mostrar el mensaje (el campo no es enfocable).
-  document.getElementById("listen_port").required = role === "server";
+  // El puerto de escucha solo lo usa el servidor.
+  document.getElementById("port-row").hidden = role !== "server";
+  updatePairingHint();
+  renderHero();
+}
+
+function updatePairingHint() {
+  const strict = document.getElementById("pairing_mode").value === "reject-unknown";
+  document.getElementById("pairing-hint").textContent = strict
+    ? "Solo se conectan equipos cuyo certificado ya conocés. Más seguro."
+    : "Ideal para emparejar por primera vez en una red de confianza.";
 }
 
 function updateCoreToggleLabel() {
-  const role = document.getElementById("role").value;
+  const role = getRole();
   const btn = document.getElementById("core-toggle");
   btn.textContent = coreRunning
-    ? "Detener servicio"
+    ? role === "server"
+      ? "Detener servidor"
+      : "Desconectar"
     : role === "server"
       ? "Iniciar servidor"
       : "Conectar";
+  // Detener es destructivo pero reversible: tono rojo suave, no relleno.
+  btn.classList.toggle("btn--primary", !coreRunning);
+  btn.classList.toggle("btn--danger", coreRunning);
 }
 
 function setConnectionIndicator(status) {
@@ -173,6 +238,14 @@ function setConnectionIndicator(status) {
   const cls = CORE_STATUS_CLASSES[status] ?? "status--offline";
   el.className = `status ${cls}`;
   el.textContent = label;
+
+  lastCoreStatus = status;
+  const hero = document.getElementById("hero");
+  if (!hero) return;
+  hero.dataset.state = status;
+  document.getElementById("hero-status-label").textContent =
+    status === "stopped" ? "Detenido" : label;
+  document.getElementById("hero-status-desc").textContent = statusDescription(status, getRole());
 }
 
 function setCoreLog(lines) {
@@ -440,20 +513,23 @@ function renderPeers() {
     nameInput.addEventListener("input", (e) => {
       peers[index].name = e.target.value;
       renderScreenMap();
+      markDirty();
     });
 
     const idInput = el("input", "input peer__id");
     idInput.type = "text";
     idInput.value = peer.device_id;
-    idInput.placeholder = "Identificador del equipo";
+    idInput.placeholder = "Identificador";
+    idInput.spellcheck = false;
     idInput.title = peer.device_id;
     idInput.setAttribute("aria-label", "Identificador del equipo vecino");
     idInput.addEventListener("input", (e) => {
       peers[index].device_id = e.target.value.trim();
       e.target.title = e.target.value;
+      markDirty();
     });
 
-    const removeButton = el("button", "btn btn--danger btn--icon btn--sm");
+    const removeButton = el("button", "btn btn--ghost btn--icon btn--sm peer__remove");
     removeButton.type = "button";
     removeButton.innerHTML = ICONS.cross;
     removeButton.title = "Quitar este equipo";
@@ -461,6 +537,7 @@ function renderPeers() {
     removeButton.addEventListener("click", () => {
       peers.splice(index, 1);
       renderPeers();
+      markDirty();
     });
 
     top.append(nameInput, idInput, removeButton);
@@ -481,6 +558,7 @@ function renderPeers() {
       radio.checked = peer.edge === value;
       radio.addEventListener("change", () => {
         peers[index].edge = value;
+        markDirty();
         // Solo se repinta el mapa: repintar las tarjetas perdería el foco.
         renderScreenMap();
       });
@@ -503,6 +581,7 @@ function addPeer(edge) {
   const side = typeof edge === "string" ? edge : "right";
   peers.push({ device_id: "", name: "", edge: side });
   renderPeers();
+  markDirty();
   // Foco en el nombre del equipo recién creado.
   document.querySelector(`.peer[data-index="${peers.length - 1}"] .peer__name`)?.focus();
 }
@@ -523,21 +602,65 @@ async function loadSettings() {
   const logLevel = document.getElementById("log_level");
   logLevel.value = settings.log_level;
   if (!logLevel.value) logLevel.value = "all";
-  document.getElementById("role").value = settings.role;
+  setRole(settings.role);
   document.getElementById("server_address").value = settings.server_address ?? "";
   peers = (settings.peers ?? []).map((p) => ({ ...p }));
   renderPeers();
   updateRoleVisibility();
   updateCoreToggleLabel();
+  setDirty(false);
+}
+
+/* --------------------------------------------------------------------------
+   Cambios sin guardar
+   -------------------------------------------------------------------------- */
+
+let dirty = false;
+
+function setDirty(value) {
+  dirty = value;
+  const bar = document.getElementById("savebar");
+  bar.dataset.dirty = String(value);
+  document.getElementById("savebar-state").textContent = value
+    ? "Cambios sin guardar"
+    : "Todo guardado";
+  document.getElementById("save-settings").disabled = !value;
+}
+
+function markDirty() {
+  if (!dirty) setDirty(true);
+}
+
+/// Validación en línea (no al enviar): marca el campo y devuelve el mensaje.
+function validateSettings(form) {
+  const name = form.device_name;
+  const nameOk = name.value.trim().length > 0;
+  name.setAttribute("aria-invalid", String(!nameOk));
+  if (!nameOk) return { field: name, message: "Poné un nombre para este equipo." };
+
+  if (getRole() === "server") {
+    const port = form.listen_port;
+    const n = Number(port.value);
+    const portOk = Number.isInteger(n) && n >= 1 && n <= 65535;
+    port.setAttribute("aria-invalid", String(!portOk));
+    if (!portOk) return { field: port, message: "El puerto tiene que estar entre 1 y 65535." };
+  }
+  return null;
 }
 
 async function saveSettings(event) {
   event.preventDefault();
   const form = event.target;
+  const invalid = validateSettings(form);
+  if (invalid) {
+    invalid.field.focus();
+    showToast(invalid.message, "error");
+    return;
+  }
   // Con búsqueda automática la dirección manual no se usa (y se limpia para
   // que no tape al descubrimiento en el core).
   const serverAddress =
-    form.role.value === "client" && !form.discovery_enabled.checked
+    getRole() === "client" && !form.discovery_enabled.checked
       ? form.server_address.value.trim()
       : "";
   const settings = {
@@ -546,13 +669,17 @@ async function saveSettings(event) {
     discovery_enabled: form.discovery_enabled.checked,
     pairing_mode: form.pairing_mode.value,
     log_level: form.log_level.value,
-    role: form.role.value,
+    role: getRole(),
     server_address: serverAddress.length > 0 ? serverAddress : null,
     peers: peers.filter((p) => p.device_id.length > 0 && p.name.length > 0),
   };
   try {
     await invoke()("save_settings", { settings });
-    showToast("Configuración guardada", "success");
+    setDirty(false);
+    showToast(
+      coreRunning ? "Guardado. Reiniciá el servicio para aplicarlo." : "Configuración guardada",
+      "success",
+    );
   } catch (error) {
     showToast(`No se pudo guardar: ${error}`, "error");
   }
@@ -587,10 +714,17 @@ async function loadDevices(status) {
   const list = document.getElementById("device-list");
   const count = document.getElementById("peer-count-indicator");
 
-  count.textContent =
-    devices.length === 0
-      ? "Sin equipos"
-      : `${devices.length} equipo${devices.length === 1 ? "" : "s"}`;
+  count.textContent = String(devices.length);
+  count.dataset.active = String(devices.some((d) => d.connected));
+  count.title = `${devices.length} equipo${devices.length === 1 ? "" : "s"}`;
+
+  // El sondeo corre cada segundo: solo se repinta si algo cambió, para no
+  // reiniciar la animación de entrada ni perder el hover.
+  const signature = `${getRole()}|` + devices
+    .map((d) => `${d.name}:${d.connected}:${d.latency_ms}`)
+    .join("\n");
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
 
   list.innerHTML = "";
   if (devices.length === 0) {
@@ -599,7 +733,9 @@ async function loadDevices(status) {
       emptyState(
         ICONS.plug,
         "Sin equipos conectados",
-        "Iniciá el servicio y esperá a que el otro equipo se conecte.",
+        getRole() === "server"
+          ? "Iniciá el servidor y abrí IonConnect en el otro equipo."
+          : "Conectate: el servidor se busca solo en la red local.",
       ),
     );
     list.append(item);
@@ -679,12 +815,32 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   document.getElementById("copy-device-id").addEventListener("click", copyDeviceId);
-  document.getElementById("role").addEventListener("change", () => {
+  document.getElementById("role-group").addEventListener("change", () => {
     updateRoleVisibility();
     updateCoreToggleLabel();
   });
   document.getElementById("discovery_enabled").addEventListener("change", updateRoleVisibility);
-  document.getElementById("device_name").addEventListener("input", renderScreenMap);
+  document.getElementById("pairing_mode").addEventListener("change", updatePairingHint);
+  document.getElementById("device_name").addEventListener("input", () => {
+    renderScreenMap();
+    renderHero();
+  });
+  const form = document.getElementById("settings-form");
+  // Cualquier cambio en el formulario marca "sin guardar"; un campo marcado
+  // inválido se limpia en cuanto el usuario lo corrige.
+  form.addEventListener("input", (event) => {
+    markDirty();
+    if (event.target.getAttribute?.("aria-invalid") === "true") validateSettings(form);
+  });
+  form.addEventListener("change", markDirty);
+  document.getElementById("discard-settings").addEventListener("click", () => {
+    loadSettings();
+    showToast("Cambios descartados", "success");
+  });
+  for (const icon of document.querySelectorAll(".role-picker__icon")) {
+    icon.innerHTML = ICONS[icon.dataset.icon] ?? "";
+  }
+  document.getElementById("file-drop-icon").innerHTML = ICONS.upload;
   document.getElementById("add-peer").addEventListener("click", () => addPeer("right"));
   document.getElementById("screen-map").addEventListener("click", onScreenMapClick);
   document.getElementById("screen-map").addEventListener("keydown", onScreenMapKeydown);
