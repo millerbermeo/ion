@@ -60,7 +60,10 @@ pub fn create_window(app: &AppHandle) -> tauri::Result<()> {
         .focusable(false)
         .visible(false)
         .build()?;
-    let _ = window.set_ignore_cursor_events(true);
+    // OJO: no llamar `set_ignore_cursor_events` acá. Con la ventana oculta
+    // (sin realizar) tao hace `unwrap` del `gdk::Window` y la app entera
+    // entra en panic al arrancar. Se aplica tras `show()` en `handle_event`.
+    drop(window);
     Ok(())
 }
 
