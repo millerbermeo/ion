@@ -420,16 +420,18 @@ impl IncomingFiles {
         let batch = partial
             .batch
             .and_then(|(id, top_level)| self.batches.get_mut(&id).map(|b| (b, top_level)));
-        match batch {
-            Some((state, top_level)) => {
-                if top_level {
-                    state.top_level.push(final_path.clone());
-                }
-                if state.kind == FileBatchKind::Downloads && top_level {
-                    info!(path = %final_path.display(), "archivo recibido");
-                }
+        // Lo que queda en la carpeta de transferencias se anuncia de a uno;
+        // dentro de un lote, solo las entradas de primer nivel.
+        let announce = if let Some((state, top_level)) = batch {
+            if top_level {
+                state.top_level.push(final_path.clone());
             }
-            None => info!(path = %final_path.display(), "archivo recibido"),
+            top_level && state.kind == FileBatchKind::Downloads
+        } else {
+            true
+        };
+        if announce {
+            info!(path = %final_path.display(), "archivo recibido");
         }
         Some(final_path)
     }

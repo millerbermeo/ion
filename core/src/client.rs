@@ -4,14 +4,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
+use ionconnect_clipboard::{ArboardProvider, ClipboardChange, ClipboardWatcher, FilesChange};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_network::{
     Backoff, Discovery, BackoffPolicy, Connection, UdpKey, connect_tls, is_newer, open_mouse_move,
 };
 use ionconnect_protocol::{
-    Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton, UdpHello,
+    Authentication, ClipboardFilesOffer, ClipboardMime, ClipboardSync, DisplayGeometry,
+    FileBatchKind, Message, MouseButton, UdpHello,
 };
 use ionconnect_shared::{DeviceId, KeyModifiers};
 use tokio::net::{TcpStream, UdpSocket};
@@ -21,7 +22,7 @@ use tokio_rustls::client::TlsStream;
 use tracing::{debug, info, warn};
 
 use crate::error::CoreError;
-use crate::file_transfer::{FileSink, serve_ipc_file_sends};
+use crate::file_transfer::{FileSink, send_paths, serve_ipc_file_sends};
 use crate::identity::local_device_id;
 use crate::udp_peers::UDP_KEY_LABEL;
 
@@ -82,7 +83,7 @@ pub async fn run_client(
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(16);
     tokio::spawn(serve_ipc_file_sends(
         config_dir.join("ipc.token"),
-        FileSink::Channel(outgoing_tx),
+        FileSink::Channel(outgoing_tx.clone()),
     ));
     // Crea `<Escritorio>/ionconnect` ya, para que el usuario la vea.
     tokio::spawn(crate::file_transfer::ensure_transfer_dir());
@@ -100,6 +101,7 @@ pub async fn run_client(
                         local_device,
                         address,
                         &mut injector,
+                        &outgoing_tx,
                         &mut outgoing_rx,
                     )
                     .await
@@ -206,7 +208,9 @@ async fn resolve_server_addresses(
             .as_deref()
             .is_some_and(|id| settings.peers.iter().any(|c| c.device_id == id))
     });
-    let addrs: Vec<SocketAddr> = peers.iter().flat_map(|p| p.socket_addrs()).collect();
+    let addrs: Vec<SocketAddr> = peers
+        .iter()
+        .flat_map(ionconnect_network::DiscoveredPeer::socket_addrs).collect();
     if addrs.is_empty() {
         return Err(CoreError::Other(
             "no se encontró ningún servidor IonConnect en la red local".to_string(),
@@ -222,6 +226,7 @@ async fn run_single_session(
     local_device: DeviceId,
     address: SocketAddr,
     injector: &mut ClientInjector,
+    outgoing_tx: &mpsc::Sender<Message>,
     outgoing_rx: &mut mpsc::Receiver<Message>,
 ) -> Result<(), CoreError> {
     let mut conn = connect_tls(address, client_config).await?;
@@ -284,6 +289,7 @@ async fn run_single_session(
         &clipboard,
         &udp_socket,
         &udp_key,
+        outgoing_tx,
         outgoing_rx,
     )
     .await
@@ -445,21 +451,20 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// listo por un canal, y `Connection` sigue teniendo un único dueño.
 async fn poll_clipboard_changes(
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
-    sink: mpsc::Sender<String>,
+    sink: mpsc::Sender<ClipboardChange>,
 ) {
     let mut ticker = tokio::time::interval(CLIPBOARD_POLL_INTERVAL);
     loop {
         ticker.tick().await;
         let clipboard = clipboard.clone();
         let polled =
-            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_once()).await;
+            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_all()).await;
         match polled {
-            Ok(Ok(Some(text))) => {
-                if sink.send(text).await.is_err() {
+            Ok(Ok(change)) => {
+                if !change.is_empty() && sink.send(change).await.is_err() {
                     break;
                 }
             }
-            Ok(Ok(None)) => {}
             Ok(Err(err)) => warn!(%err, "error leyendo el portapapeles"),
             Err(err) => {
                 warn!(%err, "la tarea de lectura del portapapeles terminó mal");
@@ -479,6 +484,7 @@ async fn session_loop(
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
+    outgoing_tx: &mpsc::Sender<Message>,
     outgoing_rx: &mut mpsc::Receiver<Message>,
 ) -> Result<(), CoreError> {
     let (clipboard_tx, clipboard_rx) = mpsc::channel(4);
@@ -501,7 +507,7 @@ async fn session_loop(
     let (moves_tx, moves_rx) = watch::channel(None);
     let (discrete_tx, discrete_rx) = mpsc::channel(128);
 
-    let injection = injection_task(injector, moves_rx, discrete_rx);
+    let injection = injection_task(injector, moves_rx, discrete_rx, outgoing_tx.clone());
     tokio::pin!(injection);
 
     let result = {
@@ -513,6 +519,7 @@ async fn session_loop(
             udp_socket,
             udp_key,
             clipboard_rx,
+            outgoing_tx,
             outgoing_rx,
             &mut incoming_files,
         );
@@ -562,7 +569,8 @@ async fn session_loop(
 async fn injection_task(
     injector: &mut ClientInjector,
     mut moves: watch::Receiver<Option<(i32, i32)>>,
-    mut discrete: mpsc::Receiver<CapturedEvent>,
+    mut discrete: mpsc::Receiver<Discrete>,
+    outgoing: mpsc::Sender<Message>,
 ) {
     let mut held = HeldInput::default();
     // Deduplicación por valor en vez de por la marca "visto" del `watch`:
@@ -579,8 +587,17 @@ async fn injection_task(
                 // Posición fresca primero — ver el comentario del doc.
                 let position = *moves.borrow_and_update();
                 inject_move_if_new(injector, position, &mut last_injected).await;
-                held.track(&event);
-                injector.inject(&event).await;
+                match event {
+                    Discrete::Input(event) => {
+                        held.track(&event);
+                        injector.inject(&event).await;
+                    }
+                    // Va por esta cola, y no directo desde el bucle de red,
+                    // justamente por el orden: tiene que resolverse después
+                    // de inyectar todo lo anterior y **antes** de la
+                    // liberación del botón que viene detrás.
+                    Discrete::DragQuery => send_dragged_files(&outgoing).await,
+                }
             }
             changed = moves.changed() => {
                 match changed {
@@ -600,10 +617,60 @@ async fn injection_task(
     // ciegas: así `HeldInput` ve la liberación real y `release_all` no
     // manda un release duplicado.
     while let Ok(event) = discrete.try_recv() {
-        held.track(&event);
-        injector.inject(&event).await;
+        if let Discrete::Input(event) = event {
+            held.track(&event);
+            injector.inject(&event).await;
+        }
     }
     held.release_all(injector).await;
+}
+
+/// Lo que viaja por la cola ordenada hacia [`injection_task`].
+#[derive(Debug, Clone, Copy)]
+enum Discrete {
+    /// Tecla o botón a inyectar.
+    Input(CapturedEvent),
+    /// El servidor avisó que el cursor sale de esta pantalla con el botón
+    /// izquierdo apretado (`Message::DragQuery`).
+    DragQuery,
+}
+
+/// Si el usuario estaba arrastrando archivos en este equipo, cancela ese
+/// arrastre y se los manda al servidor, que los deja en su carpeta de
+/// transferencias. Sin arrastre en curso no hace nada.
+///
+/// La consulta al sistema es síncrona (habla con el servidor X / con OLE) y
+/// puede tardar unos cientos de milisegundos, así que va a un hilo
+/// bloqueante; se la espera acá a propósito, porque lo que sigue en la cola
+/// es la liberación del botón y no debe inyectarse antes de saber si había
+/// que cancelar el arrastre.
+async fn send_dragged_files(outgoing: &mpsc::Sender<Message>) {
+    let paths = tokio::task::spawn_blocking(take_dragged_files)
+        .await
+        .unwrap_or_default();
+    if paths.is_empty() {
+        return;
+    }
+    info!(count = paths.len(), "enviando archivos arrastrados al servidor");
+    let outgoing = outgoing.clone();
+    tokio::spawn(async move {
+        send_paths(paths, Some(FileBatchKind::Downloads), &outgoing).await;
+    });
+}
+
+/// Archivos que el usuario está arrastrando ahora mismo en este equipo, con
+/// ese arrastre ya cancelado — o vacío si no hay ninguno.
+fn take_dragged_files() -> Vec<std::path::PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return ionconnect_input::x11::take_dragged_files().paths;
+    }
+    #[cfg(windows)]
+    {
+        return ionconnect_input::win32::take_dragged_files();
+    }
+    #[allow(unreachable_code)]
+    Vec::new()
 }
 
 /// Inyecta `position` solo si difiere de la última ya inyectada — ver el
@@ -652,11 +719,11 @@ fn accept_mouse_move(
 /// `Err` = la tarea de inyección murió: se corta la sesión para reconectar
 /// con un inyector nuevo en vez de seguir descartando entrada en silencio.
 async fn send_discrete(
-    discrete_tx: &mpsc::Sender<CapturedEvent>,
+    discrete_tx: &mpsc::Sender<Discrete>,
     event: CapturedEvent,
 ) -> Result<(), CoreError> {
     discrete_tx
-        .send(event)
+        .send(Discrete::Input(event))
         .await
         .map_err(|_| CoreError::Other("la tarea de inyección terminó inesperadamente".to_string()))
 }
@@ -665,14 +732,20 @@ async fn send_discrete(
 async fn session_loop_inner(
     conn: &mut ClientConnection,
     moves_tx: &watch::Sender<Option<(i32, i32)>>,
-    discrete_tx: &mpsc::Sender<CapturedEvent>,
+    discrete_tx: &mpsc::Sender<Discrete>,
     clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     udp_socket: &UdpSocket,
     udp_key: &UdpKey,
-    mut clipboard_rx: mpsc::Receiver<String>,
+    mut clipboard_rx: mpsc::Receiver<ClipboardChange>,
+    outgoing_tx: &mpsc::Sender<Message>,
     outgoing_rx: &mut mpsc::Receiver<Message>,
     incoming_files: &mut crate::file_transfer::IncomingFiles,
 ) -> Result<(), CoreError> {
+    // Archivos que el usuario copió en este equipo y ya se le anunciaron al
+    // servidor: `(set_id, rutas)`. El servidor los pide con ese `set_id`
+    // cuando el cursor vuelve a su pantalla (ver `crate::clipboard_files`).
+    let mut copied: Option<(u64, Vec<std::path::PathBuf>)> = None;
+    let mut next_set_id = 1u64;
     // `None` = todavía no se aceptó ningún `MouseMove` por UDP en esta
     // sesión — el primero siempre se acepta, después se exige que la
     // secuencia sea más nueva (ver `ionconnect_network::is_newer`).
@@ -709,6 +782,19 @@ async fn session_loop_inner(
                         incoming_files.on_end(end).await;
                     }
                     Some(Message::FileAbort(abort)) => incoming_files.on_abort(abort).await,
+                    Some(Message::FileBatchEnd(end)) => {
+                        finish_batch(incoming_files, clipboard, end).await;
+                    }
+                    Some(Message::ClipboardFilesRequest(request)) => {
+                        send_copied_files(copied.as_ref(), request.set_id, outgoing_tx);
+                    }
+                    Some(Message::DragQuery) => {
+                        discrete_tx.send(Discrete::DragQuery).await.map_err(|_| {
+                            CoreError::Other(
+                                "la tarea de inyección terminó inesperadamente".to_string(),
+                            )
+                        })?;
+                    }
                     Some(Message::Disconnect(_)) | None => return Ok(()),
                     _ => {}
                 }
@@ -763,11 +849,81 @@ async fn session_loop_inner(
             // Cambio local del portapapeles ya detectado por la tarea de
             // sondeo (ver `poll_clipboard_changes`) — acá solo queda
             // mandarlo, que es barato.
-            Some(text) = clipboard_rx.recv() => {
-                conn.send(Message::ClipboardSync(ClipboardSync {
-                    mime: ClipboardMime::Text,
-                    data: text.into_bytes(),
-                })).await?;
+            Some(change) = clipboard_rx.recv() => {
+                if let Some(text) = change.text {
+                    conn.send(Message::ClipboardSync(ClipboardSync {
+                        mime: ClipboardMime::Text,
+                        data: text.into_bytes(),
+                    })).await?;
+                }
+                let offer = change
+                    .files
+                    .map(|files| offer_for(files, &mut copied, &mut next_set_id));
+                if let Some(offer) = offer {
+                    conn.send(Message::ClipboardFilesOffer(offer)).await?;
+                }
+            }
+        }
+    }
+}
+
+/// Terminó de llegar un lote de archivos del servidor. Si son archivos que
+/// se copiaron allá (Ctrl+C), se publican en el portapapeles de este equipo
+/// para poder pegarlos; los arrastrados ya quedaron en su carpeta.
+async fn finish_batch(
+    incoming_files: &mut crate::file_transfer::IncomingFiles,
+    clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    end: ionconnect_protocol::FileBatchEnd,
+) {
+    if let Some(batch) = incoming_files.on_batch_end(end).await
+        && batch.kind == FileBatchKind::Clipboard
+    {
+        crate::server::publish_received_files(clipboard, batch.paths).await;
+    }
+}
+
+/// El servidor pidió los archivos anunciados con `set_id`: si siguen siendo
+/// los que el usuario tiene copiados, se los manda como lote de portapapeles.
+/// Un pedido por un anuncio viejo (ya se copió otra cosa) se ignora.
+fn send_copied_files(
+    copied: Option<&(u64, Vec<std::path::PathBuf>)>,
+    set_id: u64,
+    outgoing: &mpsc::Sender<Message>,
+) {
+    let Some((_, paths)) = copied.filter(|(current, _)| *current == set_id) else {
+        return;
+    };
+    info!(count = paths.len(), "enviando al servidor los archivos copiados acá");
+    let (paths, outgoing) = (paths.clone(), outgoing.clone());
+    // En una tarea aparte: el bucle de sesión es quien vacía el canal de
+    // salida, no puede esperarse a sí mismo.
+    tokio::spawn(async move {
+        send_paths(paths, Some(FileBatchKind::Clipboard), &outgoing).await;
+    });
+}
+
+/// Anota qué archivos tiene copiados el usuario en este equipo y arma el
+/// aviso para el servidor. Solo metadatos: los bytes viajan cuando el
+/// servidor los pide. `set_id == 0` retira el aviso anterior.
+fn offer_for(
+    files: FilesChange,
+    copied: &mut Option<(u64, Vec<std::path::PathBuf>)>,
+    next_set_id: &mut u64,
+) -> ClipboardFilesOffer {
+    match files {
+        FilesChange::Copied(paths) => {
+            info!(count = paths.len(), "archivos copiados en este equipo");
+            let set_id = *next_set_id;
+            *next_set_id += 1;
+            let file_count = u32::try_from(paths.len()).unwrap_or(u32::MAX);
+            *copied = Some((set_id, paths));
+            ClipboardFilesOffer { set_id, file_count }
+        }
+        FilesChange::Cleared => {
+            *copied = None;
+            ClipboardFilesOffer {
+                set_id: 0,
+                file_count: 0,
             }
         }
     }
@@ -984,6 +1140,11 @@ mod tests {
         }
     }
 
+    /// Canal de salida para las pruebas que no generan archivos arrastrados.
+    fn unused_outgoing() -> mpsc::Sender<Message> {
+        mpsc::channel(1).0
+    }
+
     fn recording() -> (RecordingInjector, ClientInjector) {
         let recorder = RecordingInjector::default();
         let injector = ClientInjector::Sync(Box::new(recorder.clone()));
@@ -1055,24 +1216,24 @@ mod tests {
         moves_tx.send(Some((1, 1))).expect("receiver vivo");
         moves_tx.send(Some((5, 7))).expect("receiver vivo");
         discrete_tx
-            .send(CapturedEvent::MouseButton {
+            .send(Discrete::Input(CapturedEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,
-            })
+            }))
             .await
             .expect("receiver vivo");
         discrete_tx
-            .send(CapturedEvent::MouseButton {
+            .send(Discrete::Input(CapturedEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: false,
-            })
+            }))
             .await
             .expect("receiver vivo");
         drop(moves_tx);
         drop(discrete_tx);
 
         let (recorder, mut injector) = recording();
-        injection_task(&mut injector, moves_rx, discrete_rx).await;
+        injection_task(&mut injector, moves_rx, discrete_rx, unused_outgoing()).await;
 
         assert_eq!(
             recorder.events(),
@@ -1100,18 +1261,18 @@ mod tests {
         let (discrete_tx, discrete_rx) = mpsc::channel(8);
 
         discrete_tx
-            .send(CapturedEvent::Key {
+            .send(Discrete::Input(CapturedEvent::Key {
                 keycode: 30,
                 modifiers: KeyModifiers::NONE,
                 pressed: true,
-            })
+            }))
             .await
             .expect("receiver vivo");
         drop(moves_tx);
         drop(discrete_tx);
 
         let (recorder, mut injector) = recording();
-        injection_task(&mut injector, moves_rx, discrete_rx).await;
+        injection_task(&mut injector, moves_rx, discrete_rx, unused_outgoing()).await;
 
         assert_eq!(
             recorder.events(),

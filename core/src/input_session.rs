@@ -12,6 +12,7 @@ use ionconnect_protocol::{
 use ionconnect_shared::{DeviceId, KeyModifiers};
 use tracing::{debug, info, warn};
 
+use crate::clipboard_files::{ControlEvent, ControlEvents};
 use crate::handoff::{Active, HandoffAction, HandoffState};
 use crate::key_repeat::KeyRepeater;
 use crate::routing::Routing;
@@ -40,6 +41,11 @@ const PEER_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 /// construir el `select!` de dos formas distintas.
 const IDLE_WAKEUP: Duration = Duration::from_hours(1);
 
+/// Durante cuánto se descarta la tecla que nosotros mismos inyectamos para
+/// cancelar un arrastre local (ver [`SessionState::swallow_key`]). Tiene que
+/// cubrir el viaje de ida y vuelta por el servidor X, nada más.
+const INJECTED_KEY_WINDOW: Duration = Duration::from_millis(500);
+
 /// Estado mutable de una sesión de captura: deduplicación, repetición de
 /// teclas y limitación de la tasa de `MouseMove`. Agrupado en un struct para
 /// no arrastrar media docena de parámetros sueltos por cada función del
@@ -54,10 +60,16 @@ struct SessionState {
     pending_move: Option<(DeviceId, i32, i32)>,
     last_move_sent: Instant,
     last_liveness_check: Instant,
+    /// Hacia dónde se avisan los cambios de dueño del control, para que
+    /// `clipboard_files` mande los archivos copiados/arrastrados.
+    control_events: ControlEvents,
+    /// Tecla inyectada por nosotros que la captura va a ver volver, y hasta
+    /// cuándo descartarla — ver [`Self::swallow_key`].
+    swallowed_key: Option<(u32, Instant)>,
 }
 
 impl SessionState {
-    fn new(settings: KeyRepeatSettings) -> Self {
+    fn new(settings: KeyRepeatSettings, control_events: ControlEvents) -> Self {
         // `Instant::now()` menos un intervalo: así el primer movimiento de
         // la sesión sale enseguida en vez de esperar el primer hueco. Si el
         // reloj monótono todavía no llegó a ese valor (arranque muy
@@ -74,6 +86,45 @@ impl SessionState {
             pending_move: None,
             last_move_sent: past,
             last_liveness_check: past,
+            control_events,
+            swallowed_key: None,
+        }
+    }
+
+    /// Avisa un cambio de dueño del control. Si nadie escucha (el consumidor
+    /// terminó) no hay nada que hacer: el control sigue funcionando igual.
+    fn notify(&self, event: ControlEvent) {
+        let _ = self.control_events.send(event);
+    }
+
+    /// Descarta las próximas pulsaciones de `keycode` que lleguen por la
+    /// captura. Cancelar un arrastre local inyecta un Escape por XTEST, y la
+    /// captura cruda lo ve como cualquier otra tecla: sin esto, ese Escape
+    /// que el usuario nunca apretó se reenviaría al equipo remoto.
+    fn swallow_key(&mut self, keycode: u32) {
+        self.swallowed_key = Some((keycode, Instant::now() + INJECTED_KEY_WINDOW));
+    }
+
+    /// `true` si `event` es la tecla que inyectamos nosotros y hay que
+    /// ignorarla. Vale para la pulsación y para su liberación.
+    fn is_swallowed(&mut self, event: &CapturedEvent) -> bool {
+        let Some((keycode, deadline)) = self.swallowed_key else {
+            return false;
+        };
+        if Instant::now() >= deadline {
+            self.swallowed_key = None;
+            return false;
+        }
+        matches!(*event, CapturedEvent::Key { keycode: k, .. } if k == keycode)
+    }
+
+    /// El control está por volver de `device`. Si el usuario viene con el
+    /// botón izquierdo apretado puede estar arrastrando archivos de ese
+    /// equipo hacia acá: se le pregunta **antes** de mandarle la liberación
+    /// del botón, que es la que terminaría (soltaría) el arrastre allá.
+    fn query_drag_before_leaving(&self, device: DeviceId, routing: &Routing) {
+        if self.forwarded.buttons.contains(&MouseButton::Left) {
+            routing.send_to(device, Message::DragQuery);
         }
     }
 
@@ -335,6 +386,7 @@ pub fn run_x11_input_session(
     handoff: &Arc<Mutex<HandoffState>>,
     routing: &Arc<Routing>,
     udp_peers: &Arc<UdpPeers>,
+    control_events: ControlEvents,
 ) -> Result<(), InputError> {
     let position = SharedPosition::new(0, 0);
     let mut capture = X11Capture::connect(position.clone())?;
@@ -358,7 +410,7 @@ pub fn run_x11_input_session(
         }
     });
 
-    let mut session = SessionState::new(repeat);
+    let mut session = SessionState::new(repeat, control_events);
     loop {
         // Esperar sin plazo mientras no haya nada agendado (el caso normal:
         // ninguna tecla mantenida ni posición pendiente) mantiene este hilo
@@ -504,6 +556,7 @@ fn reclaim_if_peer_gone(
             position,
             routing,
             (x, y),
+            session,
         );
     }
 }
@@ -531,6 +584,9 @@ fn handle_captured_event(
             handle_position_report(event, x, y, handoff, control, position, routing, udp_peers, session);
         }
         CapturedEvent::MouseButton { .. } | CapturedEvent::Key { .. } => {
+            if session.is_swallowed(&event) {
+                return;
+            }
             if !session.held.accept(&event) {
                 return;
             }
@@ -621,9 +677,17 @@ fn handle_position_report(
         // que le habíamos reenviado y sigue sin soltarse, antes de que el
         // nuevo dueño (local u otro peer) empiece a recibir.
         if let Active::Remote(previous_device) = previous_active {
+            if matches!(action, HandoffAction::ReturnLocal { .. }) {
+                session.query_drag_before_leaving(previous_device, routing);
+            }
             session.release_forwarded_to(previous_device, routing);
         }
-        apply_handoff_action(action, handoff, control, position, routing, (x, y));
+        apply_handoff_action(action, handoff, control, position, routing, (x, y), session);
+        if let (Active::Remote(previous_device), HandoffAction::ReturnLocal { .. }) =
+            (previous_active, action)
+        {
+            session.notify(ControlEvent::Returned(previous_device));
+        }
     } else if let Active::Remote(device) = state.active() {
         // Sin vecino enlazado en el borde que se acaba de cruzar (o
         // todavía dentro de límites): igual hay que pegar la posición al
@@ -651,10 +715,24 @@ fn apply_handoff_action(
     position: &SharedPosition,
     routing: &Routing,
     local_xy: (i32, i32),
+    session: &mut SessionState,
 ) {
     match action {
         HandoffAction::ForwardTo { device, x, y } => {
             info!(%device, x, y, "hand-off: cediendo control a equipo remoto");
+            // Cruzar con el botón izquierdo apretado puede ser un arrastre de
+            // archivos hacia el otro equipo. Hay que resolverlo antes del
+            // `grab`: mientras el arrastre viva, la aplicación de origen
+            // tiene el puntero agarrado y el nuestro fallaría. Si eran
+            // archivos, `take_dragged_files` ya canceló el arrastre local.
+            let dragged = if session.held.buttons.contains(&MouseButton::Left) {
+                ionconnect_input::x11::take_dragged_files()
+            } else {
+                ionconnect_input::x11::DraggedFiles::default()
+            };
+            if let Some(keycode) = dragged.injected_escape {
+                session.swallow_key(keycode);
+            }
             if let Err(err) = control.grab(local_xy.0, local_xy.1) {
                 // `HandoffState::on_position` ya marcó el estado como
                 // `Remote` antes de esto (necesita decidir el hand-off
@@ -677,6 +755,13 @@ fn apply_handoff_action(
             position.reset(x, y);
             if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
                 warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
+            }
+            session.notify(ControlEvent::Entered(device));
+            if !dragged.paths.is_empty() {
+                session.notify(ControlEvent::Dragged {
+                    device,
+                    paths: dragged.paths,
+                });
             }
         }
         HandoffAction::ReturnLocal { x, y } => {
@@ -747,6 +832,7 @@ pub async fn run_wayland_input_session(
     handoff: Arc<Mutex<HandoffState>>,
     routing: Arc<Routing>,
     udp_peers: Arc<UdpPeers>,
+    control_events: ControlEvents,
 ) -> Result<(), InputError> {
     let failed = session.set_barriers(&barriers).await?;
     if !failed.is_empty() {
@@ -769,7 +855,7 @@ pub async fn run_wayland_input_session(
     // configurado el usuario (a diferencia de X11, ver
     // `X11Control::key_repeat_settings`), así que acá se usan los valores
     // estándar.
-    let mut session_state = SessionState::new(KeyRepeatSettings::default());
+    let mut session_state = SessionState::new(KeyRepeatSettings::default(), control_events);
 
     // Red de seguridad para cuando el peer que tiene el control desaparece
     // (crash, se le mata el proceso, se corta la red) sin que eso dispare
@@ -927,6 +1013,7 @@ async fn handle_wayland_event(
                     if !routing.send_to(device, Message::MouseMove(MouseMove { x, y })) {
                         warn!(%device, "hand-off disparado pero el peer no está conectado en routing");
                     }
+                    state.notify(ControlEvent::Entered(device));
                 }
                 Some(HandoffAction::ReturnLocal { .. }) | None => {
                     warn!(
@@ -1015,10 +1102,12 @@ async fn handle_wayland_input(
                 drop(guard);
                 info!(x, y, "hand-off: recuperando control local");
                 state.on_control_changed();
+                state.query_drag_before_leaving(device, routing);
                 // Soltar en el peer todo lo que le habíamos mandado como
                 // presionado antes de devolver el control — si no, queda
                 // pegado en el cliente (ver `ForwardedHeld`).
                 state.release_forwarded_to(device, routing);
+                state.notify(ControlEvent::Returned(device));
                 let _ = session
                     .release(*current_activation, Some((f64::from(x), f64::from(y))))
                     .await;

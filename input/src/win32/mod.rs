@@ -8,8 +8,10 @@
 //! falta compilarlo y probarlo en Windows 11 real.
 
 mod capture;
+mod drag;
 mod inject;
 mod keymap;
 
 pub use capture::WindowsCapture;
+pub use drag::take_dragged_files;
 pub use inject::{WindowsInjector, virtual_screen_geometry};

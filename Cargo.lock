@@ -1960,6 +1960,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.60.0",
+ "windows-core 0.60.1",
  "x11rb",
 ]
 

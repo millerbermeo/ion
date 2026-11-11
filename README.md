@@ -78,7 +78,7 @@ Workspace de Cargo, un crate por responsabilidad (arquitectura limpia/hexagonal)
 | `network` | Transporte tokio: framing, heartbeat, reconexión, discovery mDNS |
 | `input` | Captura/inyección de mouse+teclado (X11, Windows, portal Wayland) |
 | `screen` | Geometría multi-monitor y hand-off de cursor entre equipos |
-| `clipboard` | Sincronización de portapapeles con prevención de bucles |
+| `clipboard` | Sincronización de portapapeles (texto y archivos copiados) con prevención de bucles |
 | `config` | Configuración TOML con recarga en caliente (incluye rol y peers) |
 | `ipc` | Canal local GUI↔core autenticado por token |
 | `core` | Orquestador: servidor (captura+enruta) y cliente (recibe+inyecta) |
@@ -98,16 +98,39 @@ Cada crate tiene su propia suite de tests (unitarios + integración contra recur
 - [x] IPC local GUI↔core
 - [x] GUI (Tauri): rol, peers con lado de pantalla, ID propio copiable
 - [x] Transferencia de archivos (arrastrar a la ventana de la GUI → se guardan en la carpeta `ionconnect` del Escritorio del otro equipo)
+- [x] Copiar y pegar archivos entre equipos: Ctrl+C en el explorador de uno, cruzar el cursor, Ctrl+V en el explorador del otro (archivos y carpetas, en ambos sentidos)
+- [x] Arrastrar archivos de un equipo al otro con el mouse: se arrastra hasta el borde de la pantalla y aparecen en la carpeta `ionconnect` del Escritorio del otro equipo
 - [x] Ciclo de vida atado a la ventana: sin bandeja, cerrar la ventana apaga `core` y avisa al otro extremo con `Disconnect`
 - [x] Binario `core`: orquesta captura→red→inyección extremo a extremo (servidor X11)
 - [x] CI que publica instaladores nativos por plataforma (GitHub Actions + `tauri-action`), sin pedirle a nadie que compile
 - [ ] Servidor (captura) en Windows/Wayland — hoy solo cliente en esas plataformas
 - [ ] Intercambio real de geometría de pantalla entre equipos (hoy se asume la misma resolución)
 - [ ] Backend de captura Wayland nativo (wlroots / `ext-input-capture-v1`)
-- [ ] Portapapeles de imágenes; copiar/pegar archivos desde el explorador (hoy la transferencia es solo por arrastre a la ventana)
+- [ ] Portapapeles de imágenes
+- [ ] Soltar el archivo arrastrado en una carpeta concreta del otro equipo (hoy siempre llega a `ionconnect` del Escritorio)
 - [ ] Soporte macOS
 
+## Pasar archivos entre equipos
+
+Hay tres formas, y ninguna de las dos primeras necesita abrir la ventana de IonConnect:
+
+| Cómo | Qué hacés | Dónde quedan |
+|---|---|---|
+| **Copiar y pegar** | Ctrl+C sobre archivos o carpetas en el explorador, llevás el cursor al otro equipo y Ctrl+V donde quieras | Donde pegues |
+| **Arrastrar** | Arrastrás los archivos hasta el borde de la pantalla que da al otro equipo y seguís de largo | Carpeta `ionconnect` del Escritorio del otro equipo |
+| **Desde la app** | Los soltás sobre la ventana de IonConnect (o "Elegir archivos…") | Carpeta `ionconnect` del Escritorio del otro equipo |
+
+Detalles que conviene saber:
+
+- Al copiar no se transfiere nada: los archivos viajan cuando el cursor cruza al otro equipo. Con archivos grandes, el Ctrl+V puede tardar un momento en estar disponible.
+- Copiar y arrastrar tienen un tope de 4 GB por vez (para que un Ctrl+C distraído sobre una carpeta enorme no llene el otro disco). El envío desde la app no tiene tope.
+- Los enlaces simbólicos dentro de una carpeta no se siguen.
+- Cortar (Ctrl+X) se trata como copiar: el original no se borra.
+
 ## Limitaciones conocidas
+
+- **Arrastrar archivos entre equipos necesita que la aplicación de origen sea X11** (incluye las que corren sobre XWayland) en Linux, u OLE estándar en Windows. Un arrastre desde una aplicación Wayland nativa —por ejemplo Nautilus en una sesión GNOME sobre Wayland— no es visible para IonConnect: en ese caso usá copiar y pegar. Verificado contra GTK 3 y GTK 4 reales; la parte de Windows compila pero no se ejercitó en una máquina Windows.
+- **Copiar y pegar archivos de un cliente a otro cliente** pasa por el servidor: funciona si el cursor pasa por la pantalla del servidor en el camino.
 
 - **El servidor (el que capta el mouse/teclado) debe ser Ubuntu X11.** Windows y Wayland ya funcionan como cliente (reciben e inyectan), pero la captura con detección de borde solo está implementada para X11.
 - **La geometría de cada peer se asume igual a la del servidor** (no hay todavía un mensaje de protocolo que intercambie resoluciones reales). El hand-off funciona correctamente como máquina de estados; el punto exacto de reingreso puede no ser perfecto si las resoluciones difieren mucho.

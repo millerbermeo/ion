@@ -2,6 +2,7 @@
 //! el que viajan las listas de archivos por el portapapeles y por
 //! arrastrar-y-soltar en Linux.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// `true` para los caracteres que una URI admite sin escapar en una ruta.
@@ -19,7 +20,7 @@ pub fn path_to_file_uri(path: &Path) -> String {
         if is_unreserved(byte) {
             uri.push(char::from(byte));
         } else {
-            uri.push_str(&format!("%{byte:02X}"));
+            let _ = write!(uri, "%{byte:02X}");
         }
     }
     uri

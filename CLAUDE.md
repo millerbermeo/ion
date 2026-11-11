@@ -30,9 +30,12 @@ cargo clippy --workspace --exclude ionconnect-gui
 cargo run -p ionconnect-core
 
 # the X11 tests that need a real X server are #[ignore]d — run them in a
-# nested display, never against your own session (they inject keys/clicks)
-Xephyr :80 -screen 800x600 -ac &
+# nested display, never against your own session (they inject keys/clicks,
+# take the clipboard and start/cancel drags)
+Xephyr :80 -screen 1024x768 -ac &
 DISPLAY=:80 cargo test -p ionconnect-input --test x11_smoke -- --ignored --test-threads=1
+DISPLAY=:80 cargo test -p ionconnect-input --test x11_drag -- --ignored --test-threads=1      # needs python3-gi (GTK 3 + 4)
+DISPLAY=:80 cargo test -p ionconnect-clipboard --test x11_files -- --ignored --test-threads=1
 ```
 
 Linux build dependencies (for the GUI/Tauri crate and packaging): `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `libdbus-1-dev`, `build-essential`.
@@ -45,13 +48,13 @@ Cargo workspace, one crate per responsibility (`Cargo.toml` lists members). Depe
 
 | Crate | Responsibility |
 |---|---|
-| `shared` | Common types (`DeviceId`, `KeyModifiers`) used everywhere |
+| `shared` | Common types (`DeviceId`, `KeyModifiers`) and `file://` URI helpers used everywhere |
 | `protocol` | Binary wire protocol — `Message` enum, encode/decode (`protocol/src/message.rs`, `codec.rs`) |
 | `crypto` | Mutual TLS 1.3 + TOFU (trust-on-first-use) trust by certificate fingerprint |
 | `network` | Tokio transport: TCP+TLS framing/reconnect/backoff/mDNS discovery, plus a **separate encrypted UDP channel** for high-frequency `MouseMove` deltas (`network/src/udp_codec.rs`) |
 | `input` | Per-OS capture/injection backends: `input/src/x11`, `input/src/win32`, `input/src/wayland` |
 | `screen` | Multi-monitor geometry (`MonitorGeometry`, `VirtualDesktop`) and screen-edge layout (`Layout`, `ScreenEdge`) — pure logic, no I/O |
-| `clipboard` | Clipboard sync with loop-guard to avoid re-broadcasting a change that was just applied remotely |
+| `clipboard` | Clipboard sync (text and copied file lists) with loop-guard to avoid re-broadcasting a change that was just applied remotely |
 | `config` | TOML config with hot-reload watcher (role, peers, listen port, pairing mode) |
 | `ipc` | Local GUI↔core channel authenticated by token |
 | `core` | Orchestrator binary (`ionconnect-core`) — wires capture→network→injection together; see below |
@@ -115,7 +118,42 @@ Drag-and-drop is also handled at the Tauri window level (`WindowEvent::DragDrop`
 
 ### File transfer
 
-Files are sent over the same reliable TCP+TLS channel as clicks/keys (not UDP): `FileOffer` → `FileChunk`* → `FileEnd` (or `FileAbort` on a read failure), implemented in `core/src/file_transfer.rs`. There's no separate flow-control — the bounded `mpsc` that messages go out through already backpressures the sender, and TCP guarantees order/delivery. Chunks (`CHUNK_SIZE`, 128 KiB) are written to `<name>.<id>.part` in the receiver's downloads folder and renamed to their final name (without clobbering an existing file) once `FileEnd` arrives. The destination is always `default_transfer_dir()` — an `ionconnect` folder on the receiving user's **Desktop**, resolved OS-agnostically via `dirs::desktop_dir()` (falls back to `~/Desktop`, then cwd) — created on `core` startup and on first receipt. Initiated by dragging files onto the GUI window; there's no file-picker on the receiving end (see README roadmap for clipboard-image/explorer-copy support, not yet implemented).
+Files are sent over the same reliable TCP+TLS channel as clicks/keys (not UDP): `FileOffer` → `FileChunk`* → `FileEnd` (or `FileAbort` on a read failure), implemented in `core/src/file_transfer.rs`. There's no separate flow-control — the bounded `mpsc` that messages go out through already backpressures the sender, and TCP guarantees order/delivery. Chunks (`CHUNK_SIZE`, 128 KiB) are written to `<name>.<id>.part` and renamed to their final name (without clobbering an existing file) once `FileEnd` arrives.
+
+Several files/folders moved in one user action travel as a **batch**: every `FileOffer` carries a `FileBatch { id, kind }` and a **relative** path with `/` separators (sanitized component by component on receipt — `sanitize_relative` — so it can never escape the destination), folders are announced with `mime = MIME_DIRECTORY` (no chunks), and `FileBatchEnd` closes it. Symlinks are skipped when walking. The batch kind picks the destination:
+
+- `FileBatchKind::Downloads` → `default_transfer_dir()`, an `ionconnect` folder on the receiving user's **Desktop** (via `dirs::desktop_dir()`, falls back to `~/Desktop`, then cwd). Used for files dragged across the screen edge and for folders sent from the GUI. A single file sent from the GUI still travels without a batch.
+- `FileBatchKind::Clipboard` → a per-batch subfolder of `clipboard_cache_dir()` (`<cache>/ionconnect/clipboard`), then published on the receiver's clipboard as a file list so Ctrl+V pastes it anywhere. The cache keeps the last two batches and is wiped on startup.
+
+Three ways to start a transfer: dropping files on the GUI window (IPC → `serve_ipc_file_sends`, no size cap), copy/paste, and mouse drag (both capped by `AUTO_TRANSFER_MAX_BYTES`, 4 GiB).
+
+### Copy/paste of files (Ctrl+C → Ctrl+V)
+
+Copying never moves bytes; **crossing the screen edge does**. `ClipboardWatcher::poll_all` reports a copied file list (`FilesChange::Copied`), and reads text only when the clipboard holds no files (file managers also offer the paths as text; syncing that would clobber the other machine's clipboard with paths that don't exist there). A list already on the clipboard at startup is not announced.
+
+The server orchestrates both directions because it is the only side that sees edge crossings — `core/src/clipboard_files.rs`:
+
+- `input_session` emits `ControlEvent::{Entered, Returned, Dragged}` over a channel (it runs on a blocking thread and must not do network/disk I/O); `run_control_events` consumes them.
+- Server → client: on `Entered(device)`, send what was copied locally if that peer doesn't have that generation yet.
+- Client → server: the client only announces (`ClipboardFilesOffer { set_id }`, `set_id = 0` withdraws); on `Returned(device)` the server asks with `ClipboardFilesRequest`. If the offer arrives while control is *not* on that client, it is requested right away (no crossing will trigger it).
+- Files received from a client become available for the next peer the control enters (client → client relay), never sent back to their origin.
+
+`ClipboardFiles` is pure state (no I/O) precisely so those rules are unit-tested in isolation.
+
+Publishing a file list on Linux does **not** go through `arboard`: it only offers `text/uri-list`, and Nautilus only enables Paste when it sees `x-special/gnome-copied-files`. `clipboard/src/x11_files.rs` takes ownership of `CLIPBOARD` with `x11rb` and serves both formats plus plain text (used on X11 sessions and on GNOME/Wayland via XWayland; other Wayland compositors keep `arboard`'s native data-control path). Reading does use `arboard`, but its `text/uri-list` parser splits on `\n` only, so with standard CRLF lists every path came back with a trailing `\r` — `normalize_path` strips it. Both were found by the real-X tests in `clipboard/tests/x11_files.rs`.
+
+### Dragging files across the edge
+
+A drag that reaches the edge is turned into a transfer to the other machine's `ionconnect` Desktop folder; the local drag is cancelled so nothing is dropped locally.
+
+- Server → client: in `apply_handoff_action`, if the left button is physically held, `x11::take_dragged_files()` runs **before** our pointer grab (while a drag is alive the source app holds the pointer grab and ours fails — which is why crossing mid-drag used to just bounce back).
+- Client → server: the server knows the left button is held on the client (`ForwardedHeld`), so on `ReturnLocal` it sends `Message::DragQuery` **before** the forwarded button release. On the client that goes through the ordered `Discrete` queue of `injection_task` so it is resolved before the release is injected (the release would otherwise complete the drop).
+
+`input/src/x11/drag.rs` does the full XDND handshake as a drop target (tiny `XdndAware` window under the pointer, 1px nudge, wait for `XdndEnter`/`XdndPosition`, convert `XdndSelection` to `text/uri-list`). Just reading `XdndSelection` is wrong: apps keep owning it after a drag ends, so a stale owner would hand back an hour-old file list as soon as the user crossed the edge while selecting text — only a source that talks to us proves a drag is live. Cancelling is toolkit-specific: Escape works for GTK 3/Qt/Chromium, but **GTK 4 ignores the keyboard during an X11 drag** (its `gdk_x11_drag_handle_event` only handles motion, button release and grab-broken), so the fallback breaks its pointer grab by unmapping the 1×1 helper window it uses as XDND source — only if the source window really is a 1×1 override-redirect helper, and it is remapped right after. Files are returned only if the drag actually ended. The injected Escape comes back through raw capture, so the server swallows it (`SessionState::swallow_key`).
+
+`input/src/win32/drag.rs` is the same idea with OLE (a nearly transparent drop-target window + `IDropTarget::DragEnter` + `CF_HDROP` + Escape). It cross-compiles (`cargo check -p ionconnect-input --target x86_64-pc-windows-gnu`) but has never run on Windows. Drags between native Wayland apps never touch the X server and are invisible to this.
+
+`input/tests/x11_drag.rs` runs against real GTK 3 and GTK 4 apps (python3-gi) in Xephyr — keep that when touching the handshake; a hand-written fake XDND source would only test our own reading of the spec.
 
 ### Installers and packaging
 

@@ -3,11 +3,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
+use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher, FilesChange};
 use ionconnect_config::Settings;
 use ionconnect_crypto::PairingMode;
 use ionconnect_network::{Discovery, UdpKey, accept_tls};
-use ionconnect_protocol::{Authentication, ClipboardMime, ClipboardSync, Message};
+use ionconnect_protocol::{
+    Authentication, ClipboardMime, ClipboardSync, FileBatchKind, Message,
+};
 use ionconnect_screen::{Layout, MonitorGeometry, ScreenEdge, VirtualDesktop};
 use ionconnect_shared::DeviceId;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -15,6 +17,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::clipboard_files::{ClipboardFiles, request_offered, run_control_events};
 use crate::display::LocalDisplay;
 use crate::error::CoreError;
 use crate::identity::local_device_id;
@@ -116,9 +119,21 @@ pub async fn run_server(
         ArboardProvider::new().map_err(|e| CoreError::Other(e.to_string()))?,
     )));
 
+    // Archivos copiados/arrastrados entre equipos: el estado compartido y
+    // el canal por el que la sesión de captura avisa los cruces de borde
+    // (ver `crate::clipboard_files`).
+    let clipboard_files = Arc::new(ClipboardFiles::new());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_control_events(
+        control_rx,
+        clipboard_files.clone(),
+        routing.clone(),
+    ));
+
     tokio::spawn(broadcast_local_clipboard_changes(
         clipboard.clone(),
         routing.clone(),
+        clipboard_files.clone(),
     ));
 
     // Canal IPC local: la GUI le pide a este proceso que mande archivos a
@@ -154,6 +169,7 @@ pub async fn run_server(
         udp_peers.clone(),
         clipboard,
         handoff.clone(),
+        clipboard_files,
     ));
 
     match backend {
@@ -161,6 +177,7 @@ pub async fn run_server(
             tracing::error!(
                 "no hay backend de captura de entrada disponible en este equipo — no va a capturar ni reenviar entrada"
             );
+            drop(control_tx);
             tokio::select! {
                 result = propagate_task(accept_handle) => result?,
                 _ = shutdown.changed() => announce_shutdown(&shutdown_routing).await,
@@ -170,7 +187,12 @@ pub async fn run_server(
         crate::display::CaptureBackend::X11 => {
             tokio::task::spawn_blocking(move || {
                 if let Err(err) =
-                    crate::input_session::run_x11_input_session(&handoff, &routing, &udp_peers)
+                    crate::input_session::run_x11_input_session(
+                        &handoff,
+                        &routing,
+                        &udp_peers,
+                        control_tx,
+                    )
                 {
                     tracing::error!(%err, "la sesión de captura de entrada terminó con error");
                 }
@@ -197,7 +219,7 @@ pub async fn run_server(
             // los dos termina `run_server`.
             tokio::select! {
                 result = propagate_task(accept_handle) => result?,
-                result = crate::input_session::run_wayland_input_session(session, barriers, handoff, routing, udp_peers) => {
+                result = crate::input_session::run_wayland_input_session(session, barriers, handoff, routing, udp_peers, control_tx) => {
                     if let Err(err) = result {
                         tracing::error!(%err, "la sesión de captura Wayland terminó con error");
                     }
@@ -239,6 +261,7 @@ async fn accept_connections(
     udp_peers: Arc<UdpPeers>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
+    clipboard_files: Arc<ClipboardFiles>,
 ) -> Result<(), CoreError> {
     loop {
         let (tcp, addr) = listener.accept().await?;
@@ -249,6 +272,7 @@ async fn accept_connections(
         let clipboard = clipboard.clone();
         let device_name = device_name.clone();
         let handoff = handoff.clone();
+        let clipboard_files = clipboard_files.clone();
 
         tokio::spawn(async move {
             let result = handle_peer_connection(
@@ -261,6 +285,7 @@ async fn accept_connections(
                 udp_peers,
                 clipboard,
                 handoff,
+                clipboard_files,
             )
             .await;
             if let Err(err) = result {
@@ -324,6 +349,7 @@ async fn handle_peer_connection(
     udp_peers: Arc<UdpPeers>,
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     handoff: Arc<std::sync::Mutex<crate::handoff::HandoffState>>,
+    clipboard_files: Arc<ClipboardFiles>,
 ) -> Result<(), CoreError> {
     // Hace falta antes de mover `tcp` a `accept_tls`: es la IP que se
     // combina con el puerto que reporte el cliente en `UdpHello` para armar
@@ -403,6 +429,33 @@ async fn handle_peer_connection(
                         incoming_files.on_end(end).await;
                     }
                     Some(Message::FileAbort(abort)) => incoming_files.on_abort(abort).await,
+                    Some(Message::FileBatchEnd(end)) => {
+                        if let Some(batch) = incoming_files.on_batch_end(end).await
+                            && batch.kind == FileBatchKind::Clipboard
+                        {
+                            // Lo que copiaron en el peer ya está en disco:
+                            // se publica en el portapapeles local y queda
+                            // disponible para los demás peers.
+                            if publish_received_files(&clipboard, batch.paths.clone()).await {
+                                clipboard_files.received_from(auth.device_id, batch.paths);
+                            }
+                        }
+                    }
+                    Some(Message::ClipboardFilesOffer(offer)) => {
+                        clipboard_files.remote_offered(auth.device_id, offer.set_id);
+                        // Normalmente se piden cuando el control vuelve de
+                        // ese peer (ver `clipboard_files`). Si el control ya
+                        // está acá —copiaron con el teclado propio de ese
+                        // equipo— no va a haber cruce que lo dispare.
+                        let control_is_there = handoff
+                            .lock()
+                            .expect("el lock de handoff no debería estar envenenado")
+                            .active()
+                            == crate::handoff::Active::Remote(auth.device_id);
+                        if !control_is_there {
+                            request_offered(&clipboard_files, &routing, auth.device_id);
+                        }
+                    }
                     Some(Message::DisplayGeometry(geometry)) => {
                         let effective = {
                             let mut guard = handoff
@@ -454,6 +507,7 @@ async fn handle_peer_connection(
     };
 
     incoming_files.abort_all().await;
+    clipboard_files.forget(auth.device_id);
     routing.unregister(auth.device_id);
     udp_peers.unregister(auth.device_id);
     info!(device_id = %auth.device_id, "peer desconectado");
@@ -469,26 +523,66 @@ async fn handle_peer_connection(
 async fn broadcast_local_clipboard_changes(
     clipboard: Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
     routing: Arc<Routing>,
+    clipboard_files: Arc<ClipboardFiles>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     loop {
         ticker.tick().await;
         let clipboard = clipboard.clone();
         let polled =
-            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_once()).await;
+            tokio::task::spawn_blocking(move || clipboard.blocking_lock().poll_all()).await;
         match polled {
-            Ok(Ok(Some(text))) => {
-                routing.broadcast(&Message::ClipboardSync(ClipboardSync {
-                    mime: ClipboardMime::Text,
-                    data: text.into_bytes(),
-                }));
+            Ok(Ok(change)) => {
+                if let Some(text) = change.text {
+                    routing.broadcast(&Message::ClipboardSync(ClipboardSync {
+                        mime: ClipboardMime::Text,
+                        data: text.into_bytes(),
+                    }));
+                }
+                // Los archivos copiados no se difunden: quedan anotados y
+                // viajan cuando el cursor cruza a otro equipo.
+                match change.files {
+                    Some(FilesChange::Copied(paths)) => {
+                        info!(count = paths.len(), "archivos copiados en este equipo");
+                        clipboard_files.local_copied(paths);
+                    }
+                    Some(FilesChange::Cleared) => clipboard_files.local_cleared(),
+                    None => {}
+                }
             }
-            Ok(Ok(None)) => {}
             Ok(Err(err)) => warn!(%err, "error leyendo el portapapeles"),
             Err(err) => {
                 warn!(%err, "la tarea de lectura del portapapeles terminó mal");
                 break;
             }
+        }
+    }
+}
+
+/// Publica en el portapapeles local los archivos recibidos de un peer.
+/// Devuelve `false` (y lo deja en el log) si el portapapeles no se pudo
+/// escribir. Va a un hilo bloqueante por el mismo motivo que la lectura.
+pub(crate) async fn publish_received_files(
+    clipboard: &Arc<AsyncMutex<ClipboardWatcher<ArboardProvider>>>,
+    paths: Vec<std::path::PathBuf>,
+) -> bool {
+    let count = paths.len();
+    let clipboard = clipboard.clone();
+    let applied =
+        tokio::task::spawn_blocking(move || clipboard.blocking_lock().apply_remote_files(paths))
+            .await;
+    match applied {
+        Ok(Ok(())) => {
+            info!(count, "archivos copiados en el otro equipo listos para pegar");
+            true
+        }
+        Ok(Err(err)) => {
+            warn!(%err, "no se pudieron publicar los archivos recibidos en el portapapeles");
+            false
+        }
+        Err(err) => {
+            warn!(%err, "la tarea de escritura del portapapeles terminó mal");
+            false
         }
     }
 }
@@ -580,6 +674,7 @@ mod tests {
                     udp_peers,
                     clipboard,
                     handoff,
+                    Arc::new(ClipboardFiles::new()),
                 )
                 .await
             }
