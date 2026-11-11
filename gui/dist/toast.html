@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IonConnect — avisos</title>
+    <!--
+      Ventana flotante del aviso de transferencias (ver
+      `gui/src-tauri/src/toast.rs`). El fondo es transparente: solo se ven
+      las tarjetas. Script externo y no inline por la CSP `default-src 'self'`.
+    -->
+    <link rel="stylesheet" href="toast.css" />
+    <script src="toast.js"></script>
+  </head>
+  <body>
+    <div id="stack" class="stack" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -11,6 +11,7 @@ mod key_repeat;
 mod peer_id;
 mod routing;
 mod server;
+mod transfer_events;
 mod trust_store;
 mod udp_peers;
 

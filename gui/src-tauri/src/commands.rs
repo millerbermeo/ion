@@ -227,6 +227,14 @@ fn stream_output(app: AppHandle, reader: impl Read + Send + 'static) {
         let buf = BufReader::new(reader);
         for raw_line in buf.lines().map_while(Result::ok) {
             let line = strip_ansi(&raw_line);
+
+            // Evento estructurado de transferencia (no es log): va directo
+            // al aviso flotante y no se muestra en el panel de registro.
+            if let Some(json) = line.trim_start().strip_prefix(crate::toast::MARKER) {
+                crate::toast::handle_event(&app, json);
+                continue;
+            }
+
             let state = app.state::<AppState>();
 
             if let Ok(mut log) = state.core_log.lock() {
@@ -385,6 +393,9 @@ pub fn start_core(app: AppHandle, state: State<AppState>) -> Result<(), String> 
     let bin = core_binary_path()?;
     let mut command = Command::new(&bin);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Pide a `core` los eventos de transferencia para el aviso flotante
+    // (ver `toast.rs`).
+    command.env("IONCONNECT_GUI_EVENTS", "1");
 
     // Nivel de registro elegido en la GUI → `RUST_LOG` del hijo (que
     // `tracing_subscriber::fmt::init` ya honra). "Todos" = `trace`. Si el

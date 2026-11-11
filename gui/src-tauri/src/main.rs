@@ -4,6 +4,7 @@
 mod commands;
 mod identity;
 mod state;
+mod toast;
 
 use serde_json::json;
 use tauri::{DragDropEvent, Manager, RunEvent, WindowEvent};
@@ -25,7 +26,18 @@ fn main() {
             commands::send_files,
             commands::send_files_dialog,
             commands::confirm_close,
+            toast::toast_idle,
         ])
+        .setup(|app| {
+            // Ventana del aviso de transferencias: se crea oculta y se
+            // muestra sola cuando `core` reporta un envío/recepción. Si no
+            // se puede crear (p. ej. sin soporte de transparencia), la app
+            // sigue funcionando sin avisos flotantes.
+            if let Err(err) = toast::create_window(app.handle()) {
+                eprintln!("no se pudo crear la ventana de avisos: {err}");
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| match event {
             // Cerrar la ventana corta las conexiones activas: se veta el
             // cierre y se le pide al frontend que muestre la confirmación.

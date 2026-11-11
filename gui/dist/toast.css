@@ -1,0 +1,311 @@
+/* ==========================================================================
+   IonConnect — aviso flotante de transferencias
+   Tarjetas al estilo de las notificaciones de macOS: material denso con
+   borde de luz, tipografía del sistema con tracking según tamaño, anillo de
+   progreso que se transforma en check/alerta, y entrada/salida por el mismo
+   camino (desde el borde derecho de la pantalla).
+
+   La ventana es transparente y no puede desenfocar el escritorio que tiene
+   detrás (backdrop-filter solo ve el contenido del propio webview), así que
+   el material es casi opaco en vez de translúcido.
+   ========================================================================== */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --card: rgba(36, 38, 44, 0.94);
+  --card-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0));
+  --edge: rgba(255, 255, 255, 0.1);
+  --edge-top: rgba(255, 255, 255, 0.14);
+  --text: #f5f5f7;
+  --text-2: rgba(235, 235, 245, 0.64);
+  --track: rgba(235, 235, 245, 0.14);
+  --accent: #0a84ff;
+  --success: #30d158;
+  --danger: #ff453a;
+  --shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.5), 0 10px 30px rgba(0, 0, 0, 0.42),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --card: rgba(252, 252, 253, 0.96);
+  --card-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0));
+  --edge: rgba(60, 60, 67, 0.12);
+  --edge-top: rgba(255, 255, 255, 0.9);
+  --text: #1c1c1e;
+  --text-2: rgba(60, 60, 67, 0.66);
+  --track: rgba(60, 60, 67, 0.12);
+  --accent: #007aff;
+  --success: #28a745;
+  --danger: #ff3b30;
+  --shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 10px 30px rgba(0, 0, 0, 0.14),
+    0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable",
+    "Segoe UI", "Inter", Ubuntu, Cantarell, Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "tnum" 1; /* cifras tabulares: el % no "baila" */
+}
+
+/* Pila anclada arriba a la derecha; el margen deja aire a la sombra. */
+.stack {
+  position: absolute;
+  inset: 0;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+/* --------------------------------------------------------------------------
+   Tarjeta
+   -------------------------------------------------------------------------- */
+
+.card {
+  position: relative;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 38px 1fr auto;
+  align-items: center;
+  column-gap: 12px;
+  padding: 12px 14px 12px 12px;
+  border-radius: 18px;
+  background: var(--card-grad), var(--card);
+  box-shadow: var(--shadow), inset 0 0.5px 0 var(--edge-top);
+  border: 0.5px solid var(--edge);
+  color: var(--text);
+  overflow: hidden;
+  will-change: transform, opacity;
+}
+
+.card__body {
+  min-width: 0;
+}
+
+.card__title {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: -0.008em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card__subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.3;
+  letter-spacing: 0.002em;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card__meta {
+  align-self: start;
+  margin-top: 1px;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--text-2);
+  transition: opacity 200ms ease;
+}
+
+/* Barra fina de progreso al pie, solo mientras transfiere. */
+.card__bar {
+  position: absolute;
+  left: 62px;
+  right: 14px;
+  bottom: 7px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--track);
+  overflow: hidden;
+  transition: opacity 260ms ease;
+}
+
+.card__bar-fill {
+  height: 100%;
+  width: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transform-origin: left center;
+  transform: scaleX(0);
+  transition: transform 220ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.card--indeterminate .card__bar-fill {
+  width: 38%;
+  transform: none;
+  animation: bar-slide 1.15s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+.card--done .card__bar,
+.card--error .card__bar,
+.card--done .card__meta,
+.card--error .card__meta {
+  opacity: 0;
+}
+
+.card--progress {
+  padding-bottom: 17px;
+}
+
+/* --------------------------------------------------------------------------
+   Icono: anillo de progreso → check / alerta
+   -------------------------------------------------------------------------- */
+
+.icon {
+  position: relative;
+  width: 38px;
+  height: 38px;
+}
+
+.icon svg {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+
+.ring__track {
+  stroke: var(--track);
+}
+
+.ring__arc {
+  stroke: var(--accent);
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+  transition:
+    stroke-dashoffset 220ms cubic-bezier(0.25, 0.1, 0.25, 1),
+    opacity 200ms ease;
+}
+
+.card--indeterminate .ring__arc {
+  animation: ring-spin 0.9s linear infinite;
+}
+
+.ring__glyph {
+  color: var(--accent);
+  transition: opacity 180ms ease, transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* El círculo de estado (verde/rojo) aparece sobre el anillo. */
+.badge {
+  opacity: 0;
+  transform: scale(0.6);
+  transform-origin: 50% 50%;
+  transition:
+    opacity 180ms ease,
+    transform 420ms cubic-bezier(0.34, 1.36, 0.64, 1);
+}
+
+.badge__mark {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  transition: stroke-dashoffset 320ms cubic-bezier(0.65, 0, 0.35, 1) 140ms;
+}
+
+.card--done .badge--success,
+.card--error .badge--error {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.card--done .badge--success .badge__mark,
+.card--error .badge--error .badge__mark {
+  stroke-dashoffset: 0;
+}
+
+.card--done .ring,
+.card--error .ring {
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.badge--success circle {
+  fill: var(--success);
+}
+
+.badge--error circle {
+  fill: var(--danger);
+}
+
+.card--error .icon {
+  animation: nudge 420ms cubic-bezier(0.36, 0.07, 0.19, 0.97) 120ms;
+}
+
+/* --------------------------------------------------------------------------
+   Animaciones
+   -------------------------------------------------------------------------- */
+
+@keyframes ring-spin {
+  to {
+    transform: rotate(270deg);
+  }
+}
+
+@keyframes bar-slide {
+  from {
+    transform: translateX(-105%);
+  }
+  to {
+    transform: translateX(270%);
+  }
+}
+
+@keyframes nudge {
+  20%,
+  60% {
+    transform: translateX(-2px);
+  }
+  40%,
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+/* Menos movimiento: sin giros, sacudidas ni rebotes — solo fundidos. */
+@media (prefers-reduced-motion: reduce) {
+  .card--indeterminate .ring__arc,
+  .card--indeterminate .card__bar-fill,
+  .card--error .icon {
+    animation: none;
+  }
+  .card--indeterminate .card__bar-fill {
+    width: 100%;
+    opacity: 0.5;
+  }
+  .badge {
+    transform: none;
+    transition: opacity 200ms ease;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .card {
+    background: var(--card);
+    border: 1px solid var(--text-2);
+  }
+}

@@ -122,6 +122,8 @@ Hay tres formas, y ninguna de las dos primeras necesita abrir la ventana de IonC
 
 Detalles que conviene saber:
 
+- Dentro de la carpeta `ionconnect` lo recibido se ordena solo por tipo: `Imágenes`, `Videos`, `Audios`, `Documentos`, `Comprimidos`, `Instaladores`, `Carpetas` (carpetas enteras) y `Otros`.
+- Mientras se transfiere aparece un aviso flotante arriba a la derecha con el progreso, y luego si salió bien o falló.
 - Al copiar no se transfiere nada: los archivos viajan cuando el cursor cruza al otro equipo. Con archivos grandes, el Ctrl+V puede tardar un momento en estar disponible.
 - Copiar y arrastrar tienen un tope de 4 GB por vez (para que un Ctrl+C distraído sobre una carpeta enorme no llene el otro disco). El envío desde la app no tiene tope.
 - Los enlaces simbólicos dentro de una carpeta no se siguen.

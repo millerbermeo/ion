@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::routing::Routing;
+use crate::transfer_events::{Direction, TransferToast, Via};
 
 /// `transfer_id` global de este proceso — solo tiene que ser único mientras
 /// una transferencia está viva, así que un contador que nunca se reinicia
@@ -76,6 +77,47 @@ pub fn default_transfer_dir() -> PathBuf {
         .or_else(|| dirs::home_dir().map(|home| home.join("Desktop")))
         .unwrap_or_else(|| PathBuf::from("."));
     desktop.join("ionconnect")
+}
+
+/// Subcarpeta de la carpeta de transferencias para las carpetas recibidas
+/// enteras (arrastradas o enviadas desde la app).
+pub const FOLDERS_SUBDIR: &str = "Carpetas";
+
+/// Subcarpeta de la carpeta de transferencias donde va a parar un archivo
+/// recibido, según su extensión — así lo que llega queda ordenado por tipo
+/// en vez de amontonado. Solo aplica a lo que termina en la carpeta de
+/// transferencias; los lotes de portapapeles van a la caché tal cual.
+#[must_use]
+pub fn category_subdir(name: &str) -> &'static str {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some(
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "heic"
+            | "heif" | "avif" | "ico" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "xcf",
+        ) => "Imágenes",
+        Some(
+            "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg"
+            | "3gp" | "ts" | "ogv",
+        ) => "Videos",
+        Some(
+            "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" | "aif"
+            | "aiff" | "mid" | "midi" | "amr",
+        ) => "Audios",
+        Some(
+            "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "xls" | "xlsx" | "ods"
+            | "csv" | "ppt" | "pptx" | "odp" | "key" | "pages" | "numbers" | "epub" | "tex",
+        ) => "Documentos",
+        Some(
+            "zip" | "rar" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "iso",
+        ) => "Comprimidos",
+        Some("deb" | "rpm" | "appimage" | "exe" | "msi" | "dmg" | "pkg" | "apk" | "flatpakref") => {
+            "Instaladores"
+        }
+        _ => "Otros",
+    }
 }
 
 /// Carpeta de caché donde aterrizan los archivos copiados en otro equipo
@@ -213,6 +255,9 @@ struct Partial {
     batch: Option<(u64, bool)>,
     received: u64,
     total: u64,
+    /// Aviso de la GUI de un archivo suelto (sin lote). Los de un lote
+    /// reportan en el aviso del lote ([`IncomingBatch::toast`]).
+    toast: Option<TransferToast>,
 }
 
 /// Un lote entrante a medio recibir.
@@ -226,6 +271,27 @@ struct IncomingBatch {
     roots: HashMap<String, PathBuf>,
     /// Entradas de primer nivel ya completas, en orden de llegada.
     top_level: Vec<PathBuf>,
+    /// Aviso de la GUI para todo el lote.
+    toast: TransferToast,
+}
+
+impl IncomingBatch {
+    /// Dónde va un archivo de primer nivel: ordenado por tipo si el lote va
+    /// a la carpeta de transferencias, tal cual si va a la caché.
+    fn file_dir(&self, name: &str) -> PathBuf {
+        match self.kind {
+            FileBatchKind::Downloads => self.dir.join(category_subdir(name)),
+            FileBatchKind::Clipboard => self.dir.clone(),
+        }
+    }
+
+    /// Dónde van las carpetas de primer nivel — mismo criterio.
+    fn folders_dir(&self) -> PathBuf {
+        match self.kind {
+            FileBatchKind::Downloads => self.dir.join(FOLDERS_SUBDIR),
+            FileBatchKind::Clipboard => self.dir.clone(),
+        }
+    }
 }
 
 /// Un lote que terminó de llegar — ver [`IncomingFiles::on_batch_end`].
@@ -263,8 +329,13 @@ impl IncomingFiles {
     }
 
     /// Estado del lote `batch`, creándolo (y su carpeta) la primera vez que
-    /// aparece.
-    async fn batch_entry(&mut self, batch: FileBatch) -> std::io::Result<&mut IncomingBatch> {
+    /// aparece. `first_name` es el nombre con el que el aviso de la GUI
+    /// presenta el lote (su primera entrada de primer nivel).
+    async fn batch_entry(
+        &mut self,
+        batch: FileBatch,
+        first_name: &str,
+    ) -> std::io::Result<&mut IncomingBatch> {
         if !self.batches.contains_key(&batch.id) {
             let dir = match batch.kind {
                 FileBatchKind::Downloads => self.dir.clone(),
@@ -283,6 +354,13 @@ impl IncomingFiles {
                     dir,
                     roots: HashMap::new(),
                     top_level: Vec::new(),
+                    toast: TransferToast::start(
+                        Direction::Receive,
+                        Via::for_receive(Some(batch.kind)),
+                        first_name,
+                        0,
+                        0,
+                    ),
                 },
             );
         }
@@ -300,20 +378,30 @@ impl IncomingFiles {
         offer: &FileOffer,
     ) -> std::io::Result<(PathBuf, String, bool)> {
         let Some(batch) = offer.batch else {
-            fs::create_dir_all(&self.dir).await?;
-            return Ok((self.dir.clone(), sanitize_name(&offer.name), true));
+            let name = sanitize_name(&offer.name);
+            let dir = self.dir.join(category_subdir(&name));
+            fs::create_dir_all(&dir).await?;
+            return Ok((dir, name, true));
         };
         let mut parts = sanitize_relative(&offer.name);
+        let first = parts.first().cloned().unwrap_or_default();
         let name = parts.pop().expect("sanitize_relative nunca devuelve vacío");
-        let state = self.batch_entry(batch).await?;
+        let state = self.batch_entry(batch, &first).await?;
         if parts.is_empty() {
-            return Ok((state.dir.clone(), name, true));
+            // Una carpeta de primer nivel se materializa en `on_offer`.
+            let dir = if offer.mime == MIME_DIRECTORY {
+                state.folders_dir()
+            } else {
+                state.file_dir(&name)
+            };
+            fs::create_dir_all(&dir).await?;
+            return Ok((dir, name, true));
         }
         let top = parts.remove(0);
         let root = if let Some(root) = state.roots.get(&top) {
             root.clone()
         } else {
-            let root = unique_path(&state.dir, &top);
+            let root = unique_path(&state.folders_dir(), &top);
             fs::create_dir_all(&root).await?;
             state.roots.insert(top, root.clone());
             state.top_level.push(root.clone());
@@ -329,6 +417,7 @@ impl IncomingFiles {
             Ok(resolved) => resolved,
             Err(err) => {
                 warn!(%err, "no se pudo preparar la carpeta destino de la transferencia");
+                self.fail_entry(&offer, "No se pudo crear la carpeta destino");
                 return;
             }
         };
@@ -344,7 +433,7 @@ impl IncomingFiles {
                 if state.roots.contains_key(&name) {
                     Ok(())
                 } else {
-                    let root = unique_path(&state.dir, &name);
+                    let root = unique_path(&state.folders_dir(), &name);
                     state.roots.insert(name.clone(), root.clone());
                     state.top_level.push(root.clone());
                     fs::create_dir_all(&root).await
@@ -354,6 +443,7 @@ impl IncomingFiles {
             };
             if let Err(err) = created {
                 warn!(%err, %name, "no se pudo crear la carpeta recibida");
+                self.fail_entry(&offer, "No se pudo crear una carpeta");
             }
             return;
         }
@@ -362,6 +452,15 @@ impl IncomingFiles {
         match fs::File::create(&part_path).await {
             Ok(file) => {
                 info!(%name, size = offer.total_size, mime = %offer.mime, "recibiendo archivo");
+                let toast = offer.batch.is_none().then(|| {
+                    TransferToast::start(
+                        Direction::Receive,
+                        Via::Folder,
+                        &name,
+                        1,
+                        offer.total_size,
+                    )
+                });
                 self.active.insert(
                     offer.transfer_id,
                     Partial {
@@ -372,10 +471,47 @@ impl IncomingFiles {
                         batch: offer.batch.map(|batch| (batch.id, top_level)),
                         received: 0,
                         total: offer.total_size,
+                        toast,
                     },
                 );
             }
-            Err(err) => warn!(%err, "no se pudo crear el archivo temporal de descarga"),
+            Err(err) => {
+                warn!(%err, "no se pudo crear el archivo temporal de descarga");
+                self.fail_entry(&offer, "No se pudo guardar el archivo");
+            }
+        }
+    }
+
+    /// Reporta al aviso de la GUI que la entrada `offer` no se pudo recibir:
+    /// dentro de un lote cuenta como un fallo del lote (que sigue); un
+    /// archivo suelto es su propio aviso, que se cierra con error.
+    fn fail_entry(&mut self, offer: &FileOffer, reason: &str) {
+        match offer
+            .batch
+            .and_then(|batch| self.batches.get_mut(&batch.id))
+        {
+            Some(state) => state.toast.note_failure(),
+            None if offer.batch.is_none() => TransferToast::start(
+                Direction::Receive,
+                Via::Folder,
+                &sanitize_name(&offer.name),
+                1,
+                offer.total_size,
+            )
+            .fail(reason),
+            None => {}
+        }
+    }
+
+    /// Aviso donde reporta progreso/fallos la transferencia `partial`: el
+    /// suyo propio o el de su lote.
+    fn toast_of<'a>(
+        batches: &'a mut HashMap<u64, IncomingBatch>,
+        partial: &'a mut Partial,
+    ) -> Option<&'a mut TransferToast> {
+        match partial.batch {
+            Some((id, _)) => batches.get_mut(&id).map(|b| &mut b.toast),
+            None => partial.toast.as_mut(),
         }
     }
 
@@ -385,12 +521,38 @@ impl IncomingFiles {
         };
         if let Err(err) = partial.file.write_all(&chunk.data).await {
             warn!(%err, "error escribiendo un trozo — se aborta la transferencia");
-            if let Some(partial) = self.active.remove(&chunk.transfer_id) {
+            if let Some(mut partial) = self.active.remove(&chunk.transfer_id) {
                 let _ = fs::remove_file(&partial.part_path).await;
+                self.close_failed(
+                    partial.toast.take(),
+                    partial.batch,
+                    "No se pudo escribir en el disco",
+                );
             }
             return;
         }
-        partial.received += chunk.data.len() as u64;
+        let len = chunk.data.len() as u64;
+        partial.received += len;
+        if let Some(toast) = Self::toast_of(&mut self.batches, partial) {
+            toast.advance(len);
+        }
+    }
+
+    /// Cierra con error el aviso de `partial` (archivo suelto) o anota el
+    /// fallo en el de su lote.
+    fn close_failed(
+        &mut self,
+        toast: Option<TransferToast>,
+        batch: Option<(u64, bool)>,
+        reason: &str,
+    ) {
+        if let Some(toast) = toast {
+            toast.fail(reason);
+        } else if let Some((id, _)) = batch
+            && let Some(state) = self.batches.get_mut(&id)
+        {
+            state.toast.note_failure();
+        }
     }
 
     /// Cierra y renombra la transferencia `transfer_id`. Devuelve la ruta
@@ -415,7 +577,15 @@ impl IncomingFiles {
         if let Err(err) = fs::rename(&partial.part_path, &final_path).await {
             warn!(%err, "no se pudo mover el archivo recibido a su nombre final");
             let _ = fs::remove_file(&partial.part_path).await;
+            self.close_failed(
+                partial.toast.take(),
+                partial.batch,
+                "No se pudo guardar el archivo",
+            );
             return None;
+        }
+        if let Some(toast) = partial.toast.take() {
+            toast.finish();
         }
         let batch = partial
             .batch
@@ -437,22 +607,30 @@ impl IncomingFiles {
     }
 
     pub async fn on_abort(&mut self, abort: FileAbort) {
-        if let Some(partial) = self.active.remove(&abort.transfer_id) {
+        if let Some(mut partial) = self.active.remove(&abort.transfer_id) {
             warn!(reason = %abort.reason, "el emisor abortó la transferencia");
             let _ = fs::remove_file(&partial.part_path).await;
+            self.close_failed(
+                partial.toast.take(),
+                partial.batch,
+                "El otro equipo no pudo leer el archivo",
+            );
         }
     }
 
     /// Cierra el lote `end.id` y devuelve lo que llegó. `None` si el lote no
     /// existe o llegó vacío (nada que publicar).
     pub async fn on_batch_end(&mut self, end: FileBatchEnd) -> Option<CompletedBatch> {
-        let state = self.batches.remove(&end.id)?;
+        let mut state = self.batches.remove(&end.id)?;
         if state.top_level.is_empty() {
             if state.kind == FileBatchKind::Clipboard {
                 let _ = fs::remove_dir_all(&state.dir).await;
             }
+            state.toast.fail("No llegó ningún archivo");
             return None;
         }
+        state.toast.set_count(state.top_level.len());
+        state.toast.finish();
         match state.kind {
             FileBatchKind::Downloads => {
                 // Las carpetas de primer nivel no pasaron por `on_end`: se
@@ -518,20 +696,24 @@ async fn send_file(path: &Path, transfer_id: u64, sink: &mpsc::Sender<Message>) 
         .and_then(|s| s.to_str())
         .unwrap_or("archivo")
         .to_string();
-    send_entry(path, name, transfer_id, None, sink).await;
+    let mut toast = TransferToast::start(Direction::Send, Via::App, &name, 1, 0);
+    send_entry(path, name, transfer_id, None, sink, &mut toast).await;
+    toast.finish();
 }
 
 /// Lee `path` y lo emite por `sink` anunciado como `name` (nombre o ruta
 /// relativa dentro de un lote). Un error al abrir o leer emite `FileAbort`
 /// (o nada, si ni siquiera se pudo anunciar). Si `sink` se cierra (la sesión
 /// terminó) se corta sin ruido. Devuelve `false` solo en ese caso, para que
-/// quien manda un lote deje de insistir.
+/// quien manda un lote deje de insistir. El progreso y los fallos de lectura
+/// se reportan en `toast`.
 async fn send_entry(
     path: &Path,
     name: String,
     transfer_id: u64,
     batch: Option<FileBatch>,
     sink: &mpsc::Sender<Message>,
+    toast: &mut TransferToast,
 ) -> bool {
     let mut file = match fs::File::open(path).await {
         Ok(file) => file,
@@ -540,6 +722,7 @@ async fn send_entry(
             // cuando no tiene espacios; la GUI parsea de `name=` al fin de
             // línea, así que soporta nombres con espacios.
             warn!(%err, %name, "no se pudo abrir el archivo a enviar");
+            toast.note_failure();
             return true;
         }
     };
@@ -576,12 +759,14 @@ async fn send_entry(
                 {
                     return false;
                 }
+                toast.advance(n as u64);
                 // Cederle el turno al resto de tareas: una transferencia
                 // grande no debe congelar el reenvío de mouse/teclado.
                 tokio::task::yield_now().await;
             }
             Err(err) => {
                 warn!(%err, %name, "error leyendo el archivo — se aborta la transferencia");
+                toast.note_failure();
                 return sink
                     .send(Message::FileAbort(FileAbort {
                         transfer_id,
@@ -678,6 +863,13 @@ pub async fn send_paths(
     } else {
         usize::MAX
     };
+    // Lo que muestra el aviso de la GUI: la primera entrada elegida y cuántas
+    // son de primer nivel (no los archivos sueltos dentro de las carpetas).
+    let first_name = paths
+        .iter()
+        .find_map(|p| p.file_name()?.to_str().map(str::to_string))
+        .unwrap_or_default();
+    let top_count = paths.len();
     let collected =
         tokio::task::spawn_blocking(move || collect_entries(&paths, max_entries)).await;
     let Ok((entries, total)) = collected else {
@@ -692,8 +884,23 @@ pub async fn send_paths(
             entries = entries.len(),
             "lo copiado/arrastrado es demasiado grande para pasarlo solo — usá el envío de archivos de la app"
         );
+        TransferToast::start(
+            Direction::Send,
+            Via::for_send(kind),
+            &first_name,
+            top_count,
+            total,
+        )
+        .fail("Demasiado grande para pasarlo solo — usá «Enviar archivos» en la app");
         return;
     }
+    let mut toast = TransferToast::start(
+        Direction::Send,
+        Via::for_send(kind),
+        &first_name,
+        top_count,
+        total,
+    );
 
     let single_file = entries.len() == 1 && !entries[0].is_dir;
     let batch = match kind {
@@ -719,17 +926,30 @@ pub async fn send_paths(
             .await
             .is_ok()
         } else {
-            send_entry(&entry.path, entry.name, transfer_id, batch, sink).await
+            send_entry(
+                &entry.path,
+                entry.name,
+                transfer_id,
+                batch,
+                sink,
+                &mut toast,
+            )
+            .await
         };
         if !delivered {
+            // La sesión se cortó: el `Drop` del aviso lo cierra con error.
             return;
         }
     }
-    if let Some(batch) = batch {
-        let _ = sink
+    if let Some(batch) = batch
+        && sink
             .send(Message::FileBatchEnd(FileBatchEnd { id: batch.id }))
-            .await;
+            .await
+            .is_err()
+    {
+        return;
     }
+    toast.finish();
 }
 
 /// A dónde van los mensajes de una transferencia saliente, según el rol de
@@ -926,7 +1146,7 @@ mod tests {
         }
 
         let final_path = got.expect("la transferencia debería completarse");
-        assert_eq!(final_path, dest.join("documento.txt"));
+        assert_eq!(final_path, dest.join("Documentos").join("documento.txt"));
         assert_eq!(std::fs::read(&final_path).unwrap(), payload);
         std::fs::remove_dir_all(&workdir).ok();
     }
@@ -981,16 +1201,28 @@ mod tests {
             .await
             .expect("la transferencia debería completarse");
 
-        assert_eq!(path, dir.join("saludo.txt"));
+        assert_eq!(path, dir.join("Documentos").join("saludo.txt"));
         assert_eq!(std::fs::read(&path).unwrap(), b"hola mundo");
         // No queda ningún .part.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("Documentos"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
             .collect();
         assert!(leftovers.is_empty(), "no debería quedar ningún .part");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn received_files_are_sorted_by_type() {
+        assert_eq!(category_subdir("Foto.JPG"), "Imágenes");
+        assert_eq!(category_subdir("clip.mp4"), "Videos");
+        assert_eq!(category_subdir("tema.flac"), "Audios");
+        assert_eq!(category_subdir("informe.pdf"), "Documentos");
+        assert_eq!(category_subdir("backup.tar.gz"), "Comprimidos");
+        assert_eq!(category_subdir("app.deb"), "Instaladores");
+        assert_eq!(category_subdir("datos.bin"), "Otros");
+        assert_eq!(category_subdir("sin-extension"), "Otros");
     }
 
     #[tokio::test]
@@ -1019,7 +1251,7 @@ mod tests {
             })
             .await;
         assert!(
-            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            std::fs::read_dir(dir.join("Otros")).unwrap().next().is_none(),
             "el .part debería haberse borrado"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1126,22 +1358,23 @@ mod tests {
         let root = sample_tree(&dir.join("origen"));
         let dest = dir.join("destino");
         // Ya hay una `raiz` en destino: la nueva no debe mezclarse con ella.
-        std::fs::create_dir_all(dest.join("raiz")).unwrap();
-        std::fs::write(dest.join("raiz/previo.txt"), b"x").unwrap();
+        let folders = dest.join(FOLDERS_SUBDIR);
+        std::fs::create_dir_all(folders.join("raiz")).unwrap();
+        std::fs::write(folders.join("raiz/previo.txt"), b"x").unwrap();
 
         let mut incoming = IncomingFiles::with_clipboard_dir(dest.clone(), dir.join("cache"));
         let completed = round_trip(vec![root], Some(FileBatchKind::Downloads), &mut incoming)
             .await
             .expect("el lote debería completarse");
 
-        let landed = dest.join("raiz (1)");
+        let landed = folders.join("raiz (1)");
         assert_eq!(completed.kind, FileBatchKind::Downloads);
         assert_eq!(completed.paths, vec![landed.clone()]);
         assert_eq!(std::fs::read(landed.join("a.txt")).unwrap(), b"contenido a");
         assert_eq!(std::fs::read(landed.join("sub/b.txt")).unwrap(), b"contenido b");
         assert!(landed.join("sub/vacia").is_dir(), "las carpetas vacías también viajan");
         assert_eq!(
-            std::fs::read_dir(dest.join("raiz")).unwrap().count(),
+            std::fs::read_dir(folders.join("raiz")).unwrap().count(),
             1,
             "la carpeta que ya existía queda intacta"
         );
