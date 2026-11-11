@@ -144,21 +144,6 @@
                 </span>
               </div>
 
-              <!-- Campos exclusivos del rol cliente -->
-              <div id="client-fields" class="field" hidden>
-                <label class="field__label" for="server_address">Dirección del servidor</label>
-                <input
-                  type="text"
-                  id="server_address"
-                  name="server_address"
-                  class="input mono"
-                  placeholder="192.168.1.10:44890"
-                />
-                <span class="field__hint">
-                  Dejalo vacío para buscar el servidor automáticamente en la red local.
-                </span>
-              </div>
-
               <!-- Campos exclusivos del rol servidor -->
               <div id="server-fields" hidden>
                 <div class="field">
@@ -232,8 +217,21 @@
                   class="switch__input"
                 />
                 <span class="switch__track"></span>
-                <span class="switch__text">Descubrimiento automático en la red local (mDNS)</span>
+                <span class="switch__text" id="discovery-text">Descubrimiento automático</span>
               </label>
+              <span class="field__hint" id="discovery-hint"></span>
+
+              <!-- Solo cliente con descubrimiento apagado -->
+              <div id="client-fields" class="field" hidden>
+                <label class="field__label" for="server_address">Dirección del servidor</label>
+                <input
+                  type="text"
+                  id="server_address"
+                  name="server_address"
+                  class="input mono"
+                  placeholder="192.168.1.10:44890 o mi-pc.local:44890"
+                />
+              </div>
 
               <div class="field">
                 <label class="field__label" for="pairing_mode">Emparejamiento</label>
@@ -247,6 +245,8 @@
                 </span>
               </div>
 
+              <details class="advanced">
+                <summary class="field__label" style="cursor: pointer">Avanzado</summary>
               <div class="field">
                 <label class="field__label" for="log_level">Nivel de registro</label>
                 <span class="select-wrap">
@@ -260,6 +260,8 @@
                   </select>
                 </span>
               </div>
+
+              </details>
 
               <div class="divider"></div>
 

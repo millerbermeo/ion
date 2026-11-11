@@ -78,6 +78,30 @@ impl Discovery {
     pub fn browse(&self) -> Result<Receiver<ServiceEvent>, NetworkError> {
         Ok(self.daemon.browse(SERVICE_TYPE)?)
     }
+
+    /// Cancela una búsqueda iniciada con [`Discovery::browse`]. Se llama al
+    /// terminar cada ronda para no acumular suscripciones al reintentar.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`NetworkError::Discovery`] si el daemon ya no responde.
+    pub fn stop_browse(&self) -> Result<(), NetworkError> {
+        self.daemon.stop_browse(SERVICE_TYPE)?;
+        Ok(())
+    }
+}
+
+impl DiscoveredPeer {
+    /// Direcciones conectables del peer, IPv4 primero (en una LAN doméstica
+    /// es lo que enruta siempre; las IPv6 link-local necesitan scope id).
+    #[must_use]
+    pub fn socket_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let mut ips: Vec<IpAddr> = self.addresses.clone();
+        ips.sort_by_key(|ip| !ip.is_ipv4());
+        ips.into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, self.port))
+            .collect()
+    }
 }
 
 /// Extrae los datos relevantes de un evento de servicio resuelto; `None`
@@ -117,5 +141,18 @@ mod tests {
     fn ignores_non_resolved_events() {
         let event = ServiceEvent::SearchStarted(SERVICE_TYPE.to_string());
         assert!(peer_from_event(&event).is_none());
+    }
+
+    #[test]
+    fn socket_addrs_prefers_ipv4() {
+        let peer = DiscoveredPeer {
+            instance_name: "pc".into(),
+            addresses: vec!["fe80::1".parse().unwrap(), "192.168.1.5".parse().unwrap()],
+            port: 44890,
+            device_id: None,
+        };
+        let addrs = peer.socket_addrs();
+        assert_eq!(addrs[0].to_string(), "192.168.1.5:44890");
+        assert_eq!(addrs.len(), 2);
     }
 }

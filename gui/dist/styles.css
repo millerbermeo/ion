@@ -1405,3 +1405,6 @@ textarea {
   color: #fff;
   filter: brightness(1.08);
 }
+
+.advanced { display: flex; flex-direction: column; gap: var(--s-3); }
+.advanced > summary { margin-bottom: var(--s-3); }

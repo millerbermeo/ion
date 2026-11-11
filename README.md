@@ -90,6 +90,7 @@ Cada crate tiene su propia suite de tests (unitarios + integración contra recur
 
 - [x] Protocolo binario + criptografía TLS/TOFU
 - [x] Transporte de red (tokio) + discovery mDNS
+- [x] Cliente encuentra al servidor por mDNS (sin `server_address`; se re-busca en cada reconexión). mDNS no cruza subredes/VLAN: ahí usar `server_address` manual (acepta `host:puerto`)
 - [x] Captura/inyección de entrada (X11 completo; Windows y portal Wayland como cliente)
 - [x] Geometría multi-monitor y hand-off de cursor
 - [x] Sincronización de portapapeles

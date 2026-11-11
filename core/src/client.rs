@@ -8,7 +8,7 @@ use ionconnect_clipboard::{ArboardProvider, ClipboardWatcher};
 use ionconnect_config::Settings;
 use ionconnect_input::{CapturedEvent, InputInjector};
 use ionconnect_network::{
-    Backoff, BackoffPolicy, Connection, UdpKey, connect_tls, is_newer, open_mouse_move,
+    Backoff, Discovery, BackoffPolicy, Connection, UdpKey, connect_tls, is_newer, open_mouse_move,
 };
 use ionconnect_protocol::{
     Authentication, ClipboardMime, ClipboardSync, DisplayGeometry, Message, MouseButton, UdpHello,
@@ -52,17 +52,20 @@ pub async fn run_client(
     let pairing_mode = crate::server::to_crypto_pairing_mode(settings.pairing_mode);
     let client_config = ionconnect_crypto::client_config(&identity, trust_store, pairing_mode)?;
 
-    let address: SocketAddr = settings
-        .server_address
-        .as_deref()
-        .ok_or_else(|| {
-            CoreError::Other(
-                "se necesita server_address (el descubrimiento automático todavía no elige uno)"
-                    .to_string(),
-            )
-        })?
-        .parse()
-        .map_err(|e| CoreError::Other(format!("server_address inválida: {e}")))?;
+    // Sin `server_address` (o con el descubrimiento activo) el servidor se
+    // busca por mDNS en cada intento de conexión, así que si el servidor
+    // cambia de IP o de equipo el cliente lo encuentra solo.
+    let discovery = if settings.server_address.is_none() && settings.discovery_enabled {
+        Some(Discovery::new()?)
+    } else {
+        None
+    };
+    if settings.server_address.is_none() && discovery.is_none() {
+        return Err(CoreError::Other(
+            "sin server_address y con el descubrimiento desactivado no hay a dónde conectar"
+                .to_string(),
+        ));
+    }
 
     // El inyector se construye **una sola vez** y se reutiliza en cada
     // reconexión. Antes se reconstruía por sesión, y en Wayland eso implica
@@ -87,14 +90,29 @@ pub async fn run_client(
     let mut backoff = Backoff::new(BackoffPolicy::default());
     loop {
         let outcome = tokio::select! {
-            outcome = run_single_session(
-                &settings,
-                client_config.clone(),
-                local_device,
-                address,
-                &mut injector,
-                &mut outgoing_rx,
-            ) => outcome,
+            outcome = async {
+                let addresses = resolve_server_addresses(&settings, discovery.as_ref()).await?;
+                let mut last_err = None;
+                for address in addresses {
+                    match run_single_session(
+                        &settings,
+                        client_config.clone(),
+                        local_device,
+                        address,
+                        &mut injector,
+                        &mut outgoing_rx,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            debug!(%address, %err, "falló este candidato, probando el siguiente");
+                            last_err = Some(err);
+                        }
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| CoreError::Other("sin direcciones".to_string())))
+            } => outcome,
             // La GUI cerró su ventana (SIGTERM): terminar sin reintentar. La
             // sesión en curso se cancela al salir del `select!`; el servidor
             // detecta la caída del TCP y recupera el control local.
@@ -120,6 +138,82 @@ pub async fn run_client(
             }
         }
     }
+}
+
+/// Cuánto espera cada ronda de descubrimiento antes de darse por vencida
+/// (el backoff del bucle principal decide cuándo reintentar).
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Candidatos a servidor para este intento: `server_address` si está
+/// configurada (acepta `host:puerto`, no solo IP literal), o los servidores
+/// `IonConnect` que respondan por mDNS. Si el emparejamiento es estricto, los
+/// equipos ya conocidos (`peers`) van primero.
+async fn resolve_server_addresses(
+    settings: &Settings,
+    discovery: Option<&Discovery>,
+) -> Result<Vec<SocketAddr>, CoreError> {
+    if let Some(manual) = settings.server_address.as_deref() {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(manual)
+            .await
+            .map_err(|e| CoreError::Other(format!("server_address inválida: {e}")))?
+            .collect();
+        return if addrs.is_empty() {
+            Err(CoreError::Other(format!("server_address sin resolver: {manual}")))
+        } else {
+            Ok(addrs)
+        };
+    }
+    let discovery = discovery.ok_or_else(|| CoreError::Other("descubrimiento inactivo".into()))?;
+    let receiver = discovery.browse()?;
+    let found = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + DISCOVERY_TIMEOUT;
+        let mut peers = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match receiver.recv_timeout(left) {
+                Ok(event) => {
+                    if let Some(peer) = ionconnect_network::peer_from_event(&event) {
+                        let known = !peers.is_empty();
+                        peers.push(peer);
+                        // Con el primero resuelto alcanza; un pequeño margen
+                        // permite que lleguen sus otras direcciones.
+                        if !known {
+                            std::thread::sleep(Duration::from_millis(300));
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+            if !peers.is_empty() {
+                // Vacía lo que ya esté listo sin bloquear más.
+                while let Ok(event) = receiver.try_recv() {
+                    if let Some(peer) = ionconnect_network::peer_from_event(&event) {
+                        peers.push(peer);
+                    }
+                }
+                break;
+            }
+        }
+        peers
+    })
+    .await
+    .map_err(|e| CoreError::Other(e.to_string()))?;
+    let _ = discovery.stop_browse();
+
+    let mut peers = found;
+    // Peers configurados (device_id conocido) primero.
+    peers.sort_by_key(|p| {
+        !p.device_id
+            .as_deref()
+            .is_some_and(|id| settings.peers.iter().any(|c| c.device_id == id))
+    });
+    let addrs: Vec<SocketAddr> = peers.iter().flat_map(|p| p.socket_addrs()).collect();
+    if addrs.is_empty() {
+        return Err(CoreError::Other(
+            "no se encontró ningún servidor IonConnect en la red local".to_string(),
+        ));
+    }
+    info!(candidates = addrs.len(), "servidor(es) descubierto(s) por mDNS");
+    Ok(addrs)
 }
 
 async fn run_single_session(

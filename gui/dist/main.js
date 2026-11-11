@@ -137,8 +137,20 @@ function copyDeviceId() {
 
 function updateRoleVisibility() {
   const role = document.getElementById("role").value;
-  document.getElementById("client-fields").hidden = role !== "client";
+  const auto = document.getElementById("discovery_enabled").checked;
+  // La dirección manual solo tiene sentido en un cliente sin búsqueda automática.
+  document.getElementById("client-fields").hidden = !(role === "client" && !auto);
   document.getElementById("server-fields").hidden = role !== "server";
+  document.getElementById("discovery-text").textContent =
+    role === "server"
+      ? "Anunciar este equipo en la red local (mDNS)"
+      : "Buscar el servidor automáticamente (mDNS)";
+  document.getElementById("discovery-hint").textContent =
+    role === "server"
+      ? "Los clientes lo encuentran solos, sin escribir la IP."
+      : auto
+        ? "Si cambiás de servidor o de IP, se reconecta solo."
+        : "";
   // `listen_port` vive dentro de #server-fields: si quedara `required`
   // mientras está oculto, la validación del formulario bloquearía el envío
   // sin poder mostrar el mensaje (el campo no es enfocable).
@@ -503,7 +515,9 @@ async function loadSettings() {
   const settings = await invoke()("get_settings");
   document.getElementById("device_name").value = settings.device_name;
   document.getElementById("listen_port").value = settings.listen_port;
-  document.getElementById("discovery_enabled").checked = settings.discovery_enabled;
+  // Un cliente con dirección manual guardada arranca con la búsqueda apagada.
+  document.getElementById("discovery_enabled").checked =
+    settings.discovery_enabled && !(settings.role === "client" && settings.server_address);
   document.getElementById("pairing_mode").value = settings.pairing_mode;
   // Si el valor guardado no existe como opción, cae en "Todos".
   const logLevel = document.getElementById("log_level");
@@ -520,7 +534,12 @@ async function loadSettings() {
 async function saveSettings(event) {
   event.preventDefault();
   const form = event.target;
-  const serverAddress = form.server_address.value.trim();
+  // Con búsqueda automática la dirección manual no se usa (y se limpia para
+  // que no tape al descubrimiento en el core).
+  const serverAddress =
+    form.role.value === "client" && !form.discovery_enabled.checked
+      ? form.server_address.value.trim()
+      : "";
   const settings = {
     device_name: form.device_name.value,
     listen_port: Number(form.listen_port.value),
@@ -664,6 +683,7 @@ window.addEventListener("DOMContentLoaded", () => {
     updateRoleVisibility();
     updateCoreToggleLabel();
   });
+  document.getElementById("discovery_enabled").addEventListener("change", updateRoleVisibility);
   document.getElementById("device_name").addEventListener("input", renderScreenMap);
   document.getElementById("add-peer").addEventListener("click", () => addPeer("right"));
   document.getElementById("screen-map").addEventListener("click", onScreenMapClick);
